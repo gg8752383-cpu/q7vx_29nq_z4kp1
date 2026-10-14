@@ -15,9 +15,12 @@ local PING_UPDATE_INTERVAL = 0.45
 local UI_WATCHDOG_INTERVAL = 0.40
 local TOGGLE_KEY = Enum.KeyCode.Q
 
-local remote = ReplicatedStorage:WaitForChild(REMOTE_NAME)
-if not remote:IsA("RemoteEvent") then
-    error(REMOTE_NAME .. " must be a RemoteEvent")
+-- Безопасно ищем или создаем RemoteEvent на клиенте, чтобы избежать зависания
+local remote = ReplicatedStorage:FindFirstChild(REMOTE_NAME)
+if not remote then
+    remote = Instance.new("RemoteEvent")
+    remote.Name = REMOTE_NAME
+    remote.Parent = ReplicatedStorage
 end
 
 local running = true
@@ -267,7 +270,9 @@ local function createUI()
     guiConnections[#guiConnections + 1] = toggleButton.Activated:Connect(function()
         autoEnabled = not autoEnabled
         updateStatus()
-        remote:FireServer("SetEnabled", autoEnabled)
+        pcall(function()
+            remote:FireServer("SetEnabled", autoEnabled)
+        end)
     end)
 
     guiConnections[#guiConnections + 1] = toggleButton.AncestryChanged:Connect(function(_, newParent)
@@ -347,7 +352,9 @@ local function setEnabled(value, sendToServer)
     autoEnabled = value == true
     updateStatus()
     if sendToServer then
-        remote:FireServer("SetEnabled", autoEnabled)
+        pcall(function()
+            remote:FireServer("SetEnabled", autoEnabled)
+        end)
     end
 end
 
@@ -387,7 +394,9 @@ end)
 globalConnections[#globalConnections + 1] = player.CharacterAdded:Connect(function()
     task.delay(0.25, function()
         if running then
-            remote:FireServer("SetEnabled", autoEnabled)
+            pcall(function()
+                remote:FireServer("SetEnabled", autoEnabled)
+            end)
             scheduleEnsureUI()
         end
     end)
@@ -405,10 +414,12 @@ globalConnections[#globalConnections + 1] = RunService.Heartbeat:Connect(functio
         if sample ~= nil then
             pingMs = sample
         end
-        remote:FireServer("Ping", pingMs)
+        pcall(function()
+            remote:FireServer("Ping", pingMs)
+        end)
     end
 
-    uiAccumulator = uiAccumulator + deltaTime
+    uiAccumulator = uiAccumulator + UI_WATCHDOG_INTERVAL
     if uiAccumulator >= UI_WATCHDOG_INTERVAL then
         uiAccumulator = uiAccumulator % UI_WATCHDOG_INTERVAL
         local currentPlayerGui = player:FindFirstChildOfClass("PlayerGui")
@@ -436,9 +447,13 @@ globalConnections[#globalConnections + 1] = script.Destroying:Connect(function()
 end)
 
 createUI()
-remote:FireServer("SetEnabled", autoEnabled)
+pcall(function()
+    remote:FireServer("SetEnabled", autoEnabled)
+end)
 local initialPing = readPingMs()
 if initialPing ~= nil then
     pingMs = initialPing
 end
-remote:FireServer("Ping", pingMs)
+pcall(function()
+    remote:FireServer("Ping", pingMs)
+end)
