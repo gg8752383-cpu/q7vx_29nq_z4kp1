@@ -1,2309 +1,2589 @@
---[[
-	HUMANLIKE AUTO-MANS v3.0  (Humanlike Auto-Dodging)
-	Размещение: StarterPlayer > StarterPlayerScripts  (LocalScript)
-
-	Управляет ТОЛЬКО движением персонажа (Humanoid:Move + короткий рывок на LinearVelocity).
-	Атаки, камеру и ввод кнопок не трогает: контратаку твоя игра запускает сама через Config.OnCounterWindow.
-
-	СЛОИ:
-	  1. ДЕТЕКЦИЯ УГРОЗ (zero-tag, чистая физика): движущиеся снаряды (парабола + гравитация), лучи/лазеры
-	     (вытянутые детали), растущие AOE-зоны. Те же алгоритмы, что в UniversalAutoEvade Ultra.
-	  2. ВРАГИ: другие игроки (по командам) + NPC из Config.NpcFolder. Читаем взгляд врага (LookVector),
-	     дистанцию, скорость сближения и АТАКИ по проигрываемым анимациям (Action-приоритет, не зациклены).
-	     Для каждого врага считается ритм атак (интервал EMA), окно контратаки после его атаки.
-	  3. ТАКТИКА: удержание оптимальной дистанции, орбитальный стрейф с нерегулярными сменами стороны,
-	     финты (байт: ложный шаг -> резкий уход), обход в мёртвую зону за спину, позиция для контратаки,
-	     упреждающий отход перед ожидаемой атакой по ритму врага.
-	  4. ГУМАНИЗАЦИЯ: реакция 50-120 мс, ограничение угловой скорости поворота, разгон/торможение вектора
-	     "стика", шум направления и скорости, микро-статтеры (рваный темп), без мгновенных разворотов на 180.
-	  5. ОКРУЖЕНИЕ: контекстное рулёжное управление по 12 рейкастам (стены) + проверка пустоты под ногами,
-	     детектор залипания (уходит вдоль самой свободной стороны, меняет сторону орбиты).
-	  6. Рывок: валидация стен и бездонных пропастей; при отказе поощряются противоположное и
-	     противоположно-диагональные направления.
-
-	ЧЕСТНО ПРО GC: математика в Heartbeat/RenderStep на числах без Vector3.new и таблиц. Редкие аллокации,
-	которые создаёт сам движок Roblox: массив GetPartBoundsInRadius, результаты рейкастов (12-24 раза за тик
-	мозга, 20 Гц), GetPlayingAnimationTracks (до 3 врагов, 10 Гц) и CFrame.lookAt для поворота на врага (20 Гц).
-]]
-
+```lua
+--==============================================================
+-- SURVIVAL AI v1.0 — "Пирожок: Мастер мансов PRO"
+-- LocalScript -> StarterPlayer > StarterPlayerScripts
+-- Changes in v1.0 (on top of v0.9 pro-movement layer):
+--   * CLUTCH DODGE: CPA (closest point of approach) prediction —
+--     the character sidesteps at the LAST possible moment, exactly
+--     like a pro dodging a chase, and picks the side with more room.
+--   * OPEN SPACE MAP: a cached 12-ray openness ring around the
+--     character; scoring now prefers wide-open escape routes, so the
+--     bot stops cornering itself against walls.
+--   * ANTI-PARALLEL penalty: never runs in the same direction as a
+--     faster chaser — cuts across their line instead (real kiting).
+--   * WALL SLIDE fallback: when every direction is blocked, slides
+--     along the wall tangent toward the safest side instead of freezing.
+--   * SPRING SMOOTHING: second-order critically-damped steering with
+--     substeps — acceleration/turns look human, not lerpy-robotic.
+--   * PANIC ADAPTATION: taking damage near threats temporarily boosts
+--     juke frequency, serpentine amplitude and jump-dodges ("full mans").
+--   * PATH CORNER BLEND: arcs through route waypoints instead of
+--     snapping sharply at every corner.
+-- Inherited from v0.9:
+--   * Serpentine dual-harmonic run, orbit strafing, juke feints with
+--     counter-flip, cooldown-gated jump-dodges, snappier juke turns.
+-- Inherited from v0.8:
+--   * Compact rounded-square toggle (tap center, drag edges).
+--   * Self-repairing GUI, remembered position, owner token.
+--   * Heartbeat planning / lightweight RenderStep Move().
+--   * Bounded threat tracking, async pathfinding fallback, stuck logic.
+-- Important:
+--   * Reactive client-side controller; not omniscient.
+--   * LocalScript controls movement only while a threat is active.
+--   * Pathfinding requires walkable/navmesh space in the place.
+--==============================================================
+--==============================================================
+-- SERVICES
+--==============================================================
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local Stats = game:GetService("Stats")
-local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
-
+local PathfindingService = game:GetService("PathfindingService")
 local LocalPlayer = Players.LocalPlayer
-local AXIS_X, AXIS_Y, AXIS_Z = Vector3.xAxis, Vector3.yAxis, Vector3.zAxis
-local ZERO = Vector3.zero
-local TAU = math.pi * 2
-local DEG = math.pi / 180
-
--- =====================================================================
--- КОНФИГ
--- =====================================================================
-local Config = {
-	StartEnabled = true,
-	Debug = false,
-	NpcModel = nil,             -- Model NPC-компаньона вместо персонажа игрока
-	ManualOverride = false,     -- true: пока игрок держит стик/WASD, авто-движение уступает (рывок остаётся)
-
-	-- Гуманизация
-	ReactionMinMs = 50,
-	ReactionMaxMs = 120,
-	TurnRateNormal = 480,       -- град/с обычный поворот вектора движения
-	TurnRateEmergency = 1100,   -- град/с в уклонении и резком уходе
-	SpeedAccel = 6,             -- рост "силы стика" в секунду
-	SpeedDecel = 9,
-	BrainHz = 20,
-
-	-- Враги и тактика
-	ConflictRange = 38,
-	OptimalMin = 8,
-	OptimalMax = 14,
-	EnemyAttackRange = 9,
-	IncludeTeammates = false,
-	NpcFolder = nil,            -- Instance, чьи дети-Model считаются NPC-врагами
-	IsEnemy = nil,              -- function(model, player|nil) -> boolean
-	AttackHitFrac = 0.38,       -- в какой доле анимации атаки происходит удар
-	MeleeReactWindow = 0.6,
-	MeleeDashLead = 0.3,
-	MeleeDashDistance = 10,
-	EvadeSideRandom = 0.2,      -- шанс выбрать "неожиданную" сторону уклонения
-	CounterWindow = 0.7,
-	OnCounterWindow = nil,      -- function(enemyModel): окно контратаки открыто (враг в восстановлении)
-	FeintChancePerSec = 0.45,
-	FlankEnabled = true,
-	FaceEnemy = true,           -- поворачивать корпус на врага (AlignOrientation), пока идёт бой
-
-	-- Сканирование угроз
-	ScanRadius = 80,
-	MaxScanParts = 1200,
-	CalmScanEvery = 2,
-	DangerScanEvery = 1,
-	DangerTTI = 0.9,
-	MinRelSpeed = 28,
-	MaxThreatSize = 24,
-	MaxProjectileRadius = 6,
-	IgnoreOtherCharacters = false,
-	SlowPruneSeconds = 0.4,
-
-	-- Предикт
-	Horizon = 1.4,
-	SampleStep = 0.04,
-	TriggerLead = 0.5,          -- включает запас на человеческую реакцию 50-120 мс
-	BodyRadius = 2.4,
-	BodyHalfHeight = 2.6,
-	HitMargin = 1.2,
-	WalkDodge = true,           -- при запасе времени сначала просто шагаем, рывок включается, если шаг не помог
-	WalkDodgeTTI = 0.42,
-
-	-- Пинг: TTI_adjusted = TTI_base + PingSign * Ping/1000  (PingSign = -1 -> уклоняться раньше на величину пинга)
-	PingSign = 1,
-	PingMaxMs = 600,
-
-	-- AOE
-	AOEGrowthRate = 8,
-	AOEMinGrowthStep = 0.3,
-	ZoneLookahead = 0.35,
-	ZoneLinger = 1.2,
-	MaxZoneRadius = 150,
-	MinZoneDiameter = 5,
-	FreshStaticZones = false,
-
-	-- BEAM
-	FreshBeams = true,
-	FreshWindow = 0.4,
-	BeamAspect = 5,
-	BeamMaxThickness = 8,
-	BeamLookahead = 0.15,
-	BeamLinger = 0.5,
-
-	-- Рывок
-	DashDistance = 15,
-	DashMaxDistance = 30,
-	DashMinDistance = 5,
-	DashDuration = 0.2,
-	DashAvgSpeed = 75,
-	DashCooldown = 0.85,
-	DashForce = 1e7,
-	PostDashSettle = 0.12,
-	WallPadding = 1.6,
-	VoidCheckDepth = 45,
-
-	-- State Guard
-	TreatZeroWalkSpeedAsStun = true,
-	DetectRagdollConstraints = true,
-	ExtraBlockCheck = nil,      -- function() -> true, если действовать нельзя
-	OnDodge = nil,              -- function(dirVector3, distance)
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local PlayerScripts = LocalPlayer:WaitForChild("PlayerScripts")
+local OWNER_ATTRIBUTE = "SurvivalAI_PirozhokOwner"
+local OWNER_TOKEN = tostring(os.clock()) .. "_" .. tostring(
+    Random.new():NextInteger(100000, 999999999)
+)
+PlayerScripts:SetAttribute(OWNER_ATTRIBUTE, OWNER_TOKEN)
+--==============================================================
+-- CONFIGURATION
+--==============================================================
+local CONFIG = {
+    START_ENABLED = false,
+    TOGGLE_KEY = Enum.KeyCode.G,
+    DETECTION_RADIUS = 68,
+    FLEE_RADIUS = 43,
+    FAST_APPROACH_SPEED = 7.5,
+    EMERGENCY_DISTANCE = 12,
+    EMERGENCY_CLOSING_SPEED = 12,
+    EMERGENCY_CLOSING_DISTANCE = 21,
+    EMERGENCY_TIME_TO_CONTACT = 0.68,
+    EMERGENCY_TTC_MAX_DISTANCE = 30,
+    SCAN_INTERVAL = 0.19,
+    THINK_INTERVAL = 0.13,
+    DIRECTION_COUNT = 8,
+    PRECISE_DIRECTION_COUNT = 4,
+    MAX_THREATS_TO_CONSIDER = 12,
+    MAX_TRACKED_THREATS = 32,
+    PROBE_DISTANCE = 10,
+    LOOK_AHEAD_DISTANCE = 10,
+    SIDE_PROBE_OFFSET = 1.35,
+    MAX_SAFE_DROP = 5.5,
+    MAX_STEP_UP = 5.5,
+    PREDICTION_TIME = 0.60,
+    TURN_RESPONSE = 10,
+    EMERGENCY_TURN_RESPONSE = 20,
+    INERTIA_WEIGHT = 0.22,
+    LOW_HEALTH_RATIO = 0.30,
+    WEAVE_STRENGTH = 0.20,
+    WEAVE_SWITCH_MIN = 0.80,
+    WEAVE_SWITCH_MAX = 1.35,
+    WEAVE_FREQUENCY = 2.6,
+    TACTICAL_SIDE_STEP_STRENGTH = 0.72,
+    STUCK_CHECK_INTERVAL = 0.90,
+    STUCK_MIN_PROGRESS = 0.65,
+    STUCK_SPEED_LIMIT = 2.0,
+    STUCK_PENALTY_TIME = 1.45,
+    PATHFINDING_ENABLED = true,
+    AVOID_WATER = true,
+    PATH_RETRY_INTERVAL = 1.70,
+    PATH_GOAL_DISTANCE = 34,
+    PATH_START_DRIFT_LIMIT = 8,
+    PATH_CANDIDATES = 4,
+    PATH_AGENT_RADIUS = 2,
+    PATH_AGENT_HEIGHT = 5,
+    PATH_AGENT_CAN_JUMP = true,
+    PATH_AGENT_CAN_CLIMB = true,
+    PATH_WAYPOINT_SPACING = 4,
+    PATH_REACHED_DISTANCE = 3.5,
+    PATH_JUMP_TRIGGER_DISTANCE = 8,
+    --==========================================================
+    -- PRO-PLAYER MOVEMENT LAYER (v0.9)
+    -- Direction changes only; WalkSpeed is never modified.
+    --==========================================================
+    JUKE_ENABLED = true,
+    JUKE_MIN_INTERVAL = 1.5,
+    JUKE_MAX_INTERVAL = 3.3,
+    JUKE_DURATION_MIN = 0.16,
+    JUKE_DURATION_MAX = 0.34,
+    JUKE_REVERSE_CHANCE = 0.22,
+    JUKE_TRIGGER_MAX_DISTANCE = 30,
+    JUKE_EMERGENCY_BIAS = 0.35,
+    JUKE_TURN_RESPONSE = 15,
+    STRAFE_ENABLED = true,
+    STRAFE_DISTANCE_MIN = 14,
+    STRAFE_DISTANCE_MAX = 34,
+    STRAFE_WEIGHT = 0.55,
+    STRAFE_SIDE_FLIP_MIN = 1.1,
+    STRAFE_SIDE_FLIP_MAX = 2.2,
+    SERPENTINE_ENABLED = true,
+    SERPENTINE_BASE_AMPLITUDE = 0.26,
+    SERPENTINE_SECOND_HARMONIC = 0.13,
+    SERPENTINE_FREQ_MIN = 1.9,
+    SERPENTINE_FREQ_MAX = 3.1,
+    SERPENTINE_FREQ_CHANGE_MIN = 2.2,
+    SERPENTINE_FREQ_CHANGE_MAX = 4.4,
+    JUMP_DODGE_ENABLED = true,
+    JUMP_DODGE_COOLDOWN_MIN = 0.9,
+    JUMP_DODGE_COOLDOWN_MAX = 2.3,
+    JUMP_DODGE_TRIGGER_DISTANCE = 26,
+    JUMP_DODGE_CHANCE = 0.45,
+    --==========================================================
+    -- CLUTCH DODGE (v1.0): last-moment CPA sidestep
+    --==========================================================
+    CLUTCH_DODGE_ENABLED = true,
+    CLUTCH_CPA_TIME_MIN = 0.12,
+    CLUTCH_CPA_TIME_MAX = 0.55,
+    CLUTCH_CPA_DISTANCE = 8.0,
+    CLUTCH_DODGE_DURATION = 0.26,
+    CLUTCH_DODGE_COOLDOWN = 0.75,
+    CLUTCH_CHECK_INTERVAL = 0.05,
+    CLUTCH_TURN_RESPONSE = 18,
+    CLUTCH_ESCAPE_BLEND = 0.30,
+    --==========================================================
+    -- OPEN SPACE MAP (v1.0): anti-cornering
+    --==========================================================
+    OPENNESS_ENABLED = true,
+    OPENNESS_RAYS = 12,
+    OPENNESS_PROBE_DISTANCE = 14,
+    OPENNESS_REFRESH_INTERVAL = 0.32,
+    OPENNESS_SCORE_WEIGHT = 0.55,
+    ANTI_PARALLEL_WEIGHT = 0.45,
+    WALL_SLIDE_ENABLED = true,
+    --==========================================================
+    -- SPRING SMOOTHING (v1.0): human-like steering
+    --==========================================================
+    SPRING_SMOOTHING_ENABLED = true,
+    SPRING_DAMPING_RATIO = 1.0,
+    --==========================================================
+    -- PANIC ADAPTATION (v1.0): got hit -> play harder briefly
+    --==========================================================
+    PANIC_ENABLED = true,
+    PANIC_HEALTH_DROP = 1,
+    PANIC_DURATION = 3.0,
+    PANIC_JUKE_SPEEDUP = 0.5,
+    PANIC_SERPENTINE_BOOST = 1.6,
+    PANIC_JUMP_BOOST = 1.4,
+    --==========================================================
+    -- PATH CORNER BLEND (v1.0)
+    --==========================================================
+    PATH_CORNER_BLEND_DISTANCE = 6,
+    DEBUG = false,
 }
-
--- =====================================================================
--- СОСТОЯНИЕ
--- =====================================================================
-local rng = Random.new()
-local Enabled = Config.StartEnabled
-local pingMs = 0
-local fsm = "Idle" -- Idle | Combat | Evading | Cooldown | Blocked | Disabled
-local cachedReason = nil
-local MIN_SP2 = Config.MinRelSpeed * Config.MinRelSpeed
-
-local ctx = {
-	char = nil, hum = nil, hrp = nil,
-	lv = nil, att = nil, ao = nil,
-	rayParams = nil, overlapParams = nil,
-	conns = {},
-	dashing = false, dashStart = 0, dashDur = 0.2, dashDir = Vector3.zero, dashPeak = 0,
-	cooldownEnd = 0, settleUntil = 0,
-	lastDirX = 0, lastDirZ = 0, lastDirTime = -10,
-}
-
--- контроллер движения (все поля — числа/булевы, без аллокаций)
-local MV_DODGE, MV_MELEE, MV_UNSTICK = 1, 2, 3
-local Ctl = {
-	active = false, facing = false, prevAutoRotate = true,
-	heading = 0, speed = 0,
-	wantX = 0, wantZ = 0, wantSpeed = 0, wantTurn = 480,
-	mvActive = false, mvX = 0, mvZ = 0, mvUntil = 0, mvSpeed = 1, mvKind = 0,
-	threatUntil = 0,
-	orbitDir = rng:NextNumber() < 0.5 and 1 or -1, nextFlipAt = 0,
-	nextStutterAt = 0, stutterUntil = 0, stutterScale = 1,
-	feintPhase = 0, feintUntil = 0, feintCooldown = 0, feintSide = 1,
-	flankUntil = 0, nextFlankAt = 0, flankSide = 1,
-	pendingDodgeAt = 0, noDelayUntil = 0,
-	meleeReactAt = 0, meleeFor = nil,
-	stuckT = 0, stuckX = 0, stuckZ = 0, unstickUntil = 0, unstickX = 0, unstickZ = 0,
-	noiseSeed = rng:NextNumber(0, 1000),
-	nextEnemyRefresh = 0,
-}
-
--- угрозы (проектили / лучи / зоны)
+--==============================================================
+-- STATE
+--==============================================================
+local enabled = CONFIG.START_ENABLED
+local alive = false
+local character
+local humanoid
+local rootPart
+local raycastParams
 local threats = {}
-local pool = {}
-local watch = setmetatable({}, { __mode = "k" })
-local bornAt = setmetatable({}, { __mode = "k" })
-local scanIdx = 0
-local stagger = 0
-local frame = 0
-local dangerUntil = 0
-local active = {}
-local activeN = 0
-
--- кандидаты направлений рывка
-local MAXC = 48
-local candX, candZ, candBonus, candScore, candUsed = {}, {}, {}, {}, {}
-local candN = 0
-local N_DIR = 12
-local baseCos, baseSin = {}, {}
-for i = 0, 11 do
-	local a = i * (TAU / 12)
-	baseCos[i + 1] = math.cos(a)
-	baseSin[i + 1] = math.sin(a)
-end
-
--- карта окружения (обновляется мозгом)
-local RAY_LEN = 8
-local rayClear, rayVoid = {}, {}
-for i = 1, N_DIR do
-	rayClear[i] = 1
-	rayVoid[i] = false
-end
-
--- враги
-local enemyMap = {}
-local enemyList = {}
-local enemyN = 0
-local epoch = 0
-local target = nil
-local seenTracks = setmetatable({}, { __mode = "k" })
-
-local MOVER_CLASSES = { "BodyVelocity", "BodyForce", "BodyPosition", "BodyThrust", "LinearVelocity", "VectorForce", "AlignPosition" }
-
-local BAD_STATES = {
-	[Enum.HumanoidStateType.Dead] = true,
-	[Enum.HumanoidStateType.Ragdoll] = true,
-	[Enum.HumanoidStateType.FallingDown] = true,
-	[Enum.HumanoidStateType.Physics] = true,
-	[Enum.HumanoidStateType.PlatformStanding] = true,
-	[Enum.HumanoidStateType.Seated] = true,
-}
-
-local refreshUI -- forward declaration
-
--- =====================================================================
--- ХЕЛПЕРЫ
--- =====================================================================
-local function dbg(...)
-	if Config.Debug then
-		print("[HumanlikeAutoMans]", ...)
-	end
-end
-
-local function hasMover(part)
-	for i = 1, #MOVER_CLASSES do
-		if part:FindFirstChildWhichIsA(MOVER_CLASSES[i]) then
-			return true
-		end
-	end
-	return false
-end
-
-local function getTarget()
-	return Config.NpcModel or LocalPlayer.Character
-end
-
-local function segDist2(ox, oy, oz, dx, dy, dz, len, px, py, pz)
-	local rx, ry, rz = px - ox, py - oy, pz - oz
-	local t = rx * dx + ry * dy + rz * dz
-	if t < 0 then
-		t = 0
-	elseif t > len then
-		t = len
-	end
-	local qx, qy, qz = rx - dx * t, ry - dy * t, rz - dz * t
-	return qx * qx + qy * qy + qz * qz
-end
-
-local function slotOf(dx, dz)
-	local a = math.atan2(dz, dx)
-	if a < 0 then
-		a += TAU
-	end
-	return math.floor(a / (TAU / 12) + 0.5) % 12 + 1
-end
-
--- =====================================================================
--- STATE MACHINE GUARD
--- =====================================================================
-local function guardReason()
-	local char, hum, hrp = ctx.char, ctx.hum, ctx.hrp
-	if not char or char.Parent == nil or not hum or hum.Parent == nil or not hrp or hrp.Parent == nil then
-		return "NoCharacter"
-	end
-	if hum.Health <= 0 then
-		return "Dead"
-	end
-	if BAD_STATES[hum:GetState()] then
-		return "BadHumanoidState"
-	end
-	if hum.PlatformStand then
-		return "PlatformStand"
-	end
-	if hum.Sit then
-		return "Seated"
-	end
-	if hrp.Anchored then
-		return "Anchored"
-	end
-	if Config.TreatZeroWalkSpeedAsStun and hum.WalkSpeed <= 0.05 then
-		return "Rooted"
-	end
-	if Config.DetectRagdollConstraints then
-		local bs = char:FindFirstChildWhichIsA("BallSocketConstraint", true)
-		if bs and bs.Enabled then
-			return "RagdollConstraints"
-		end
-	end
-	if Config.ExtraBlockCheck then
-		local ok, r = pcall(Config.ExtraBlockCheck)
-		if ok and r then
-			return "Custom"
-		end
-	end
-	return nil
-end
-
--- =====================================================================
--- ПИНГ
--- =====================================================================
-local function updatePing()
-	local ok, v = pcall(function()
-		return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
-	end)
-	if ok and type(v) == "number" then
-		v = math.clamp(v, 0, Config.PingMaxMs)
-		if pingMs == 0 then
-			pingMs = v
-		else
-			pingMs = pingMs * 0.5 + v * 0.5
-		end
-	end
-end
-
--- =====================================================================
--- МАНЁВР (шаг/уход под управлением рулёжки) И РЫВОК
--- =====================================================================
-local function startManeuver(now, dx, dz, kind, duration)
-	local m = math.sqrt(dx * dx + dz * dz)
-	if m < 1e-4 then
-		return
-	end
-	Ctl.mvActive = true
-	Ctl.mvX, Ctl.mvZ = dx / m, dz / m
-	Ctl.mvKind = kind
-	Ctl.mvUntil = now + duration
-	Ctl.mvSpeed = 1
-	if Ctl.mvUntil > Ctl.threatUntil then
-		Ctl.threatUntil = Ctl.mvUntil
-	end
-	Ctl.feintPhase = 0
-end
-
-local function endDash()
-	local c = ctx
-	if c.lv then
-		c.lv.VectorVelocity = Vector3.zero
-		c.lv.Enabled = false
-	end
-	if c.dashing then
-		c.settleUntil = os.clock() + Config.PostDashSettle
-	end
-	c.dashing = false
-end
-
-local function startDash(now, dx, dz, dist)
-	local c = ctx
-	if not c.lv or not c.lv.Parent then
-		return false
-	end
-	local dur = math.max(Config.DashDuration, dist / Config.DashAvgSpeed)
-	c.dashDur = dur
-	c.dashDir = AXIS_X * dx + AXIS_Z * dz
-	c.dashPeak = 1.5 * dist / dur
-	c.dashStart = now
-	c.dashing = true
-	c.cooldownEnd = now + Config.DashCooldown
-	c.lastDirX, c.lastDirZ, c.lastDirTime = dx, dz, now
-	c.lv.VectorVelocity = c.dashDir * c.dashPeak
-	c.lv.Enabled = true
-	Ctl.pendingDodgeAt = 0
-	-- после рывка человек не замирает, а продолжает движение в ту же сторону
-	startManeuver(now, dx, dz, MV_DODGE, dur + 0.22)
-	if Config.OnDodge then
-		pcall(Config.OnDodge, c.dashDir, dist)
-	end
-	dbg("dash", dx, dz, dist, dur)
-	return true
-end
-
--- =====================================================================
--- ДЕТЕКЦИЯ УГРОЗ: записи, наблюдение, скан
--- =====================================================================
-local function releaseRecord(rec)
-	rec.part = nil
-	pool[#pool + 1] = rec
-end
-
-local function newRecord(part, kind, now, px, py, pz, vx, vy, vz, m, growth)
-	local rec = pool[#pool]
-	if rec then
-		pool[#pool] = nil
-	else
-		rec = {}
-	end
-	rec.part = part
-	rec.kind = kind
-	rec.firstSeen = now
-	rec.lastSeen = now
-	rec.t = now
-	rec.px, rec.py, rec.pz = px, py, pz
-	rec.vx, rec.vy, rec.vz = vx, vy, vz
-	rec.s = m
-	rec.growth = growth or 0
-	rec.anchored = part.Anchored
-	rec.samples = 0
-	rec.tti, rec.baseTti = math.huge, math.huge
-	rec.urgent = false
-	rec.handledUntil = 0
-	rec.dirx, rec.dirz, rec.hasDir = 0, 0, false
-	rec.slowSince = 0
-	rec.activeUntil = math.huge
-	rec.gravity = false
-	rec.accY = 0
-	rec.hitR, rec.radius, rec.safeR, rec.halfY = 0, 0, 0, 0
-	rec.ox, rec.oy, rec.oz, rec.ax, rec.ay, rec.az, rec.blen, rec.lim = 0, 0, 0, 0, 0, 0, 0, 0
-	if kind == "Proj" then
-		rec.radius = math.min(m * 0.5, Config.MaxProjectileRadius)
-		rec.hitR = rec.radius + Config.BodyRadius + Config.HitMargin
-		rec.gravity = (not rec.anchored) and not hasMover(part)
-		rec.accY = rec.gravity and -Workspace.Gravity or 0
-	elseif kind == "AOE" then
-		rec.radius = math.min(m * 0.5, Config.MaxZoneRadius)
-		rec.halfY = rec.radius
-		rec.safeR = rec.radius + Config.BodyRadius + Config.HitMargin
-		rec.activeUntil = now + Config.ZoneLinger
-	else
-		rec.activeUntil = now + Config.BeamLinger
-	end
-	return rec
-end
-
-local function clearThreats()
-	for part, rec in pairs(threats) do
-		threats[part] = nil
-		releaseRecord(rec)
-	end
-	activeN = 0
-end
-
-local function updateRecord(rec, now)
-	local part = rec.part
-	local p = part.Position
-	local px, py, pz = p.X, p.Y, p.Z
-	local dt = now - rec.t
-	if rec.kind == "Proj" then
-		local vx, vy, vz
-		local anch = part.Anchored
-		rec.anchored = anch
-		if anch then
-			if dt > 0.004 then
-				vx = rec.vx * 0.4 + ((px - rec.px) / dt) * 0.6
-				vy = rec.vy * 0.4 + ((py - rec.py) / dt) * 0.6
-				vz = rec.vz * 0.4 + ((pz - rec.pz) / dt) * 0.6
-			else
-				vx, vy, vz = rec.vx, rec.vy, rec.vz
-			end
-			rec.gravity = false
-		else
-			local v = part.AssemblyLinearVelocity
-			vx, vy, vz = v.X, v.Y, v.Z
-			if dt > 0.01 then
-				rec.accY = rec.accY * 0.7 + ((vy - rec.vy) / dt) * 0.3
-				rec.samples += 1
-				if rec.samples >= 4 then
-					rec.gravity = rec.accY < -0.5 * Workspace.Gravity
-				end
-			end
-		end
-		rec.vx, rec.vy, rec.vz = vx, vy, vz
-		rec.t = now
-	else
-		local s = part.Size
-		local m = math.max(s.X, s.Y, s.Z)
-		if dt > 0.004 then
-			local gr = (m - rec.s) / dt
-			rec.growth = rec.growth * 0.6 + gr * 0.4
-			if gr >= Config.AOEGrowthRate then
-				local untilT = now + (rec.kind == "AOE" and Config.ZoneLinger or Config.BeamLinger)
-				if untilT > rec.activeUntil then
-					rec.activeUntil = untilT
-				end
-			end
-			rec.s = m
-			rec.t = now
-		end
-	end
-	rec.px, rec.py, rec.pz = px, py, pz
-	rec.lastSeen = now
-end
-
-local function acceptZone(part, myRoot)
-	if part.AssemblyRootPart == myRoot then
-		return false
-	end
-	if Config.IgnoreOtherCharacters then
-		local model = part:FindFirstAncestorOfClass("Model")
-		if model and model:FindFirstChildOfClass("Humanoid") then
-			return false
-		end
-	end
-	return true
-end
-
-local function acceptProj(part, m, myRoot)
-	if m > Config.MaxThreatSize then
-		return false
-	end
-	return acceptZone(part, myRoot)
-end
-
-local function zoneKind(s, m)
-	local a, b, c3 = s.X, s.Y, s.Z
-	local mn = math.min(a, b, c3)
-	local mid = a + b + c3 - m - mn
-	if m / math.max(mid, 0.05) >= Config.BeamAspect and mid <= Config.BeamMaxThickness then
-		return "Beam"
-	end
-	return "AOE"
-end
-
-local function tryFresh(part, s, m, now, px, py, pz, myRoot)
-	if part.CanCollide or not acceptZone(part, myRoot) then
-		return
-	end
-	local kind = zoneKind(s, m)
-	if kind == "Beam" then
-		if Config.FreshBeams and m >= 4 then
-			watch[part] = nil
-			threats[part] = newRecord(part, "Beam", now, px, py, pz, 0, 0, 0, m, 0)
-		end
-	elseif Config.FreshStaticZones and m >= Config.MinZoneDiameter and m <= Config.MaxZoneRadius * 2 then
-		watch[part] = nil
-		threats[part] = newRecord(part, "AOE", now, px, py, pz, 0, 0, 0, m, 0)
-	end
-end
-
-local function scheduleWatch(w)
-	if w.n < 4 then
-		w.n += 1
-		w.next = scanIdx + 1
-	else
-		stagger = (stagger + 1) % 3
-		w.next = scanIdx + 3 + stagger
-	end
-end
-
-local function observePart(part, w, now, mvx, mvy, mvz, myRoot)
-	if part.Anchored then
-		local p = part.Position
-		local px, py, pz = p.X, p.Y, p.Z
-		local s = part.Size
-		local m = math.max(s.X, s.Y, s.Z)
-		if not w then
-			w = { x = px, y = py, z = pz, t = now, s = m, n = 0, next = 0 }
-			watch[part] = w
-			scheduleWatch(w)
-			local born = bornAt[part]
-			if born and now - born <= Config.FreshWindow then
-				tryFresh(part, s, m, now, px, py, pz, myRoot)
-			end
-			return
-		end
-		local dt = now - w.t
-		if dt > 0.25 then
-			w.x, w.y, w.z, w.t, w.s = px, py, pz, now, m
-			w.n = 0
-			scheduleWatch(w)
-			return
-		end
-		if dt <= 0.004 then
-			return
-		end
-		local vx, vy, vz = (px - w.x) / dt, (py - w.y) / dt, (pz - w.z) / dt
-		local dm = m - w.s
-		local growth = dm / dt
-		w.x, w.y, w.z, w.t, w.s = px, py, pz, now, m
-		local rvx, rvy, rvz = vx - mvx, vy - mvy, vz - mvz
-		if rvx * rvx + rvy * rvy + rvz * rvz >= MIN_SP2 then
-			if acceptProj(part, m, myRoot) then
-				watch[part] = nil
-				threats[part] = newRecord(part, "Proj", now, px, py, pz, vx, vy, vz, m, 0)
-				return
-			end
-		elseif growth >= Config.AOEGrowthRate and dm >= Config.AOEMinGrowthStep then
-			if acceptZone(part, myRoot) then
-				watch[part] = nil
-				threats[part] = newRecord(part, zoneKind(s, m), now, px, py, pz, 0, 0, 0, m, growth)
-				return
-			end
-		end
-		scheduleWatch(w)
-	else
-		if w then
-			watch[part] = nil
-		end
-		local v = part.AssemblyLinearVelocity
-		local vx, vy, vz = v.X, v.Y, v.Z
-		local rvx, rvy, rvz = vx - mvx, vy - mvy, vz - mvz
-		if rvx * rvx + rvy * rvy + rvz * rvz >= MIN_SP2 then
-			local s = part.Size
-			local m = math.max(s.X, s.Y, s.Z)
-			if acceptProj(part, m, myRoot) then
-				local p = part.Position
-				threats[part] = newRecord(part, "Proj", now, p.X, p.Y, p.Z, vx, vy, vz, m, 0)
-			end
-		end
-	end
-end
-
-local function prune(now)
-	local slowLimit = Config.SlowPruneSeconds
-	for part, rec in pairs(threats) do
-		if rec.lastSeen < now - 0.2
-			or part.Parent == nil
-			or now > rec.activeUntil
-			or (rec.slowSince > 0 and now - rec.slowSince > slowLimit) then
-			threats[part] = nil
-			releaseRecord(rec)
-		end
-	end
-end
-
-local function ScanForThreats(now)
-	scanIdx += 1
-	local c = ctx
-	local hrp = c.hrp
-	local hv = hrp.AssemblyLinearVelocity
-	local mvx, mvy, mvz = hv.X, hv.Y, hv.Z
-	local myRoot = hrp.AssemblyRootPart
-	local parts = Workspace:GetPartBoundsInRadius(hrp.Position, Config.ScanRadius, c.overlapParams)
-	local terrain = Workspace.Terrain
-	for i = 1, #parts do
-		local part = parts[i]
-		local rec = threats[part]
-		if rec then
-			updateRecord(rec, now)
-		elseif part ~= terrain then
-			local w = watch[part]
-			if not (w and w.next > scanIdx) then
-				observePart(part, w, now, mvx, mvy, mvz, myRoot)
-			end
-		end
-	end
-	prune(now)
-end
-
--- =====================================================================
--- ОЦЕНКА УГРОЗ
--- =====================================================================
-local function pushActive(rec)
-	rec.urgent = true
-	activeN += 1
-	active[activeN] = rec
-end
-
-local function evalProj(rec, mx, my, mz, mvx, mvy, mvz, pingSec, grav, now)
-	local rvx, rvy, rvz = rec.vx - mvx, rec.vy - mvy, rec.vz - mvz
-	local sp2 = rvx * rvx + rvy * rvy + rvz * rvz
-	if sp2 < MIN_SP2 then
-		if rec.slowSince == 0 then
-			rec.slowSince = now
-		end
-		return
-	end
-	rec.slowSince = 0
-
-	local rx, ry, rz = rec.px - mx, rec.py - my, rec.pz - mz
-	if -(rx * rvx + ry * rvy + rz * rvz) <= 0 then
-		return -- Dot((M - P), V_rel) <= 0: удаляется
-	end
-
-	local R = rec.hitR
-	local R2 = R * R
-	local hh = Config.BodyHalfHeight
-	local g = rec.gravity and -grav or 0
-	local step = Config.SampleStep
-	local horizon = Config.Horizon
-
-	local hitT = nil
-	local x0, y0, z0 = rx, ry, rz
-	local t0 = 0
-	while t0 < horizon do
-		local t1 = t0 + step
-		local x1 = rx + rvx * t1
-		local z1 = rz + rvz * t1
-		local y1 = ry + rvy * t1 + 0.5 * g * t1 * t1
-		local ex, ey, ez = x1 - x0, y1 - y0, z1 - z0
-		local l2 = ex * ex + ey * ey + ez * ez
-		local u = 0
-		if l2 > 1e-9 then
-			u = -(x0 * ex + y0 * ey + z0 * ez) / l2
-			if u < 0 then
-				u = 0
-			elseif u > 1 then
-				u = 1
-			end
-		end
-		local qx, qy, qz = x0 + ex * u, y0 + ey * u, z0 + ez * u
-		local ay = math.abs(qy) - hh
-		if ay < 0 then
-			ay = 0
-		end
-		local d2 = qx * qx + qz * qz + ay * ay
-		if d2 <= R2 then
-			local back = 0
-			if l2 > 1e-9 then
-				back = math.sqrt(R2 - d2) / (math.sqrt(l2) / step)
-			end
-			hitT = t0 + u * step - back
-			if hitT < 0 then
-				hitT = 0
-			end
-			break
-		end
-		x0, y0, z0 = x1, y1, z1
-		t0 = t1
-	end
-	if hitT == nil then
-		return
-	end
-
-	dangerUntil = now + 0.4
-	local adj = hitT + Config.PingSign * pingSec
-	if adj < 0 or hitT <= 0.001 then
-		adj = 0
-	end
-	rec.baseTti = hitT
-	rec.tti = adj
-
-	local hs2 = rvx * rvx + rvz * rvz
-	if hs2 >= 4 then
-		local hs = math.sqrt(hs2)
-		rec.dirx, rec.dirz, rec.hasDir = rvx / hs, rvz / hs, true
-	else
-		rec.hasDir = false
-	end
-
-	if adj <= Config.TriggerLead then
-		pushActive(rec)
-	end
-end
-
-local function evalAOE(rec, mx, my, mz, now)
-	local part = rec.part
-	local s = part.Size
-	local sx, sy, sz = s.X, s.Y, s.Z
-	local m = math.max(sx, sy, sz)
-	local mn = math.min(sx, sy, sz)
-	local radius = math.min(m * 0.5, Config.MaxZoneRadius)
-	local grow = rec.growth
-	if grow < 0 then
-		grow = 0
-	end
-	local radP = radius + grow * 0.5 * Config.ZoneLookahead
-	rec.radius = radius
-	rec.safeR = radP + Config.BodyRadius + Config.HitMargin
-	if mn < 0.35 * m then
-		rec.halfY = mn * 0.5 + 1
-	else
-		rec.halfY = radius
-	end
-	local dx, dz = mx - rec.px, mz - rec.pz
-	local ay = math.abs(my - rec.py) - Config.BodyHalfHeight - rec.halfY
-	if ay < 0 then
-		ay = 0
-	end
-	if math.sqrt(dx * dx + dz * dz + ay * ay) > rec.safeR then
-		return
-	end
-	rec.tti, rec.baseTti = 0, 0
-	dangerUntil = now + 0.4
-	pushActive(rec)
-end
-
-local function beamGeometry(rec)
-	local part = rec.part
-	local s = part.Size
-	local cf = part.CFrame
-	local axis, len, w
-	if s.Z >= s.X and s.Z >= s.Y then
-		axis, len, w = cf.LookVector, s.Z, math.max(s.X, s.Y)
-	elseif s.X >= s.Y then
-		axis, len, w = cf.RightVector, s.X, math.max(s.Y, s.Z)
-	else
-		axis, len, w = cf.UpVector, s.Y, math.max(s.X, s.Z)
-	end
-	local ext = rec.growth
-	if ext < 0 then
-		ext = 0
-	end
-	local L = len + ext * Config.BeamLookahead
-	local c = cf.Position
-	local h = L * 0.5
-	rec.ox, rec.oy, rec.oz = c.X - axis.X * h, c.Y - axis.Y * h, c.Z - axis.Z * h
-	rec.ax, rec.ay, rec.az = axis.X, axis.Y, axis.Z
-	rec.blen = L
-	rec.lim = w * 0.5 + Config.BodyHalfHeight * 0.9 + Config.HitMargin * 0.5
-end
-
-local function evalBeam(rec, mx, my, mz, now)
-	beamGeometry(rec)
-	local d2 = segDist2(rec.ox, rec.oy, rec.oz, rec.ax, rec.ay, rec.az, rec.blen, mx, my, mz)
-	if d2 <= rec.lim * rec.lim then
-		rec.tti, rec.baseTti = 0, 0
-		dangerUntil = now + 0.4
-		pushActive(rec)
-	end
-end
-
-local function evaluate(now)
-	activeN = 0
-	local c = ctx
-	local p = c.hrp.Position
-	local v = c.hrp.AssemblyLinearVelocity
-	local mx, my, mz = p.X, p.Y, p.Z
-	local mvx, mvy, mvz = v.X, v.Y, v.Z
-	local pingSec = pingMs / 1000
-	local grav = Workspace.Gravity
-	for _, rec in pairs(threats) do
-		rec.urgent = false
-		if now >= rec.handledUntil then
-			local kind = rec.kind
-			if kind == "Proj" then
-				evalProj(rec, mx, my, mz, mvx, mvy, mvz, pingSec, grav, now)
-			elseif kind == "AOE" then
-				evalAOE(rec, mx, my, mz, now)
-			else
-				evalBeam(rec, mx, my, mz, now)
-			end
-		end
-	end
-end
-
--- =====================================================================
--- РЕШЕНИЕ ПО УГРОЗАМ
--- =====================================================================
-local function addCand(x, z, bonus)
-	if candN >= MAXC then
-		return
-	end
-	local m = math.sqrt(x * x + z * z)
-	if m < 1e-4 then
-		return
-	end
-	candN += 1
-	candX[candN] = x / m
-	candZ[candN] = z / m
-	candBonus[candN] = bonus
-	candScore[candN] = 0
-	candUsed[candN] = false
-end
-
-local function dashDisp(t, D, delay, dur)
-	local u = (t - delay) / dur
-	if u <= 0 then
-		return 0
-	end
-	if u >= 1 then
-		return D
-	end
-	return D * 1.5 * (u - u * u * u / 3)
-end
-
-local function projClearance(rec, cx, cz, D, dur, delay, mx, my, mz, grav)
-	local rx, ry, rz = rec.px - mx, rec.py - my, rec.pz - mz
-	local vx, vy, vz = rec.vx, rec.vy, rec.vz
-	local g = rec.gravity and -grav or 0
-	local tEnd = math.min(rec.baseTti + 0.3, Config.Horizon + 0.3)
-	local step = Config.SampleStep
-	local hh = Config.BodyHalfHeight
-	local s0 = dashDisp(0, D, delay, dur)
-	local x0 = rx - cx * s0
-	local z0 = rz - cz * s0
-	local y0 = ry
-	local minD2 = math.huge
-	local t0 = 0
-	while t0 < tEnd do
-		local t1 = t0 + step
-		local s1 = dashDisp(t1, D, delay, dur)
-		local x1 = rx + vx * t1 - cx * s1
-		local z1 = rz + vz * t1 - cz * s1
-		local y1 = ry + vy * t1 + 0.5 * g * t1 * t1
-		local ex, ey, ez = x1 - x0, y1 - y0, z1 - z0
-		local l2 = ex * ex + ey * ey + ez * ez
-		local u = 0
-		if l2 > 1e-9 then
-			u = -(x0 * ex + y0 * ey + z0 * ez) / l2
-			if u < 0 then
-				u = 0
-			elseif u > 1 then
-				u = 1
-			end
-		end
-		local qx, qy, qz = x0 + ex * u, y0 + ey * u, z0 + ez * u
-		local ay = math.abs(qy) - hh
-		if ay < 0 then
-			ay = 0
-		end
-		local d2 = qx * qx + qz * qz + ay * ay
-		if d2 < minD2 then
-			minD2 = d2
-		end
-		x0, y0, z0 = x1, y1, z1
-		t0 = t1
-	end
-	return math.sqrt(minD2) - rec.hitR
-end
-
-local function aoeClearance(rec, cx, cz, D, dur, delay, mx, my, mz)
-	local s = dashDisp(0.16 + delay, D, delay, dur)
-	local dx = mx + cx * s - rec.px
-	local dz = mz + cz * s - rec.pz
-	local ay = math.abs(my - rec.py) - Config.BodyHalfHeight - rec.halfY
-	if ay < 0 then
-		ay = 0
-	end
-	return math.sqrt(dx * dx + dz * dz + ay * ay) - rec.safeR
-end
-
-local function beamClearance(rec, cx, cz, D, dur, delay, mx, my, mz)
-	local s = dashDisp(0.12 + delay, D, delay, dur)
-	local d2 = segDist2(rec.ox, rec.oy, rec.oz, rec.ax, rec.ay, rec.az, rec.blen, mx + cx * s, my, mz + cz * s)
-	return math.sqrt(d2) - rec.lim
-end
-
--- Обязательная Raycast-проверка: стены (грудь/ноги/голова) + пустота под серединой и концом рывка.
-local function validateDir(dx, dz, D)
-	local c = ctx
-	local origin = c.hrp.Position
-	local dir = AXIS_X * dx + AXIS_Z * dz
-	local pad = Config.WallPadding
-	local free = D
-	local reach = dir * (D + pad)
-	local hh = Config.BodyHalfHeight
-
-	local r1 = Workspace:Raycast(origin, reach, c.rayParams)
-	if r1 then
-		free = math.min(free, r1.Distance - pad)
-	end
-	local r2 = Workspace:Raycast(origin - AXIS_Y * (hh * 0.8), reach, c.rayParams)
-	if r2 then
-		free = math.min(free, r2.Distance - pad)
-	end
-	local r3 = Workspace:Raycast(origin + AXIS_Y * (hh * 0.7), reach, c.rayParams)
-	if r3 then
-		free = math.min(free, r3.Distance - pad)
-	end
-	if free < Config.DashMinDistance then
-		return nil, "wall"
-	end
-
-	-- Void Check: пол должен быть и в середине, и в конечной точке рывка
-	local down = -AXIS_Y * Config.VoidCheckDepth
-	if not Workspace:Raycast(origin + dir * (free * 0.5), down, c.rayParams) then
-		return nil, "void"
-	end
-	if not Workspace:Raycast(origin + dir * free, down, c.rayParams) then
-		return nil, "void"
-	end
-	return free, nil
-end
-
-local function decide(now)
-	local c = ctx
-	local p = c.hrp.Position
-	local mx, my, mz = p.X, p.Y, p.Z
-	local delay = pingMs / 2000
-	local grav = Workspace.Gravity
-	local look = c.hrp.CFrame.LookVector
-	local hh = Config.BodyHalfHeight
-	local D = Config.DashDistance
-	local urgentMin = math.huge
-
-	candN = 0
-	for i = 1, 12 do
-		addCand(baseCos[i], baseSin[i], 0)
-	end
-
-	for i = 1, activeN do
-		local rec = active[i]
-		local kind = rec.kind
-		if rec.tti < urgentMin then
-			urgentMin = rec.tti
-		end
-		if kind == "Proj" then
-			if rec.hasDir then
-				-- V_evasion = V_dir x Vector3.yAxis = (-dz, 0, dx)
-				local sx, sz = -rec.dirz, rec.dirx
-				local lat = (mx - rec.px) * sx + (mz - rec.pz) * sz
-				local pref = lat >= 0 and 1 or -1
-				addCand(sx * pref, sz * pref, -0.9)
-				addCand(-sx * pref, -sz * pref, -0.6)
-			else
-				addCand(mx - rec.px, mz - rec.pz, -0.9)
-			end
-		elseif kind == "AOE" then
-			-- СТРОГО из центра зоны наружу
-			local ax, az = mx - rec.px, mz - rec.pz
-			local hd2 = ax * ax + az * az
-			local ay = math.abs(my - rec.py) - hh - rec.halfY
-			if ay < 0 then
-				ay = 0
-			end
-			local dist = math.sqrt(hd2 + ay * ay)
-			if hd2 < 0.09 then
-				ax, az = -look.X, -look.Z
-			end
-			addCand(ax, az, -2.5)
-			local need = rec.safeR - dist + 1.5
-			if need > D then
-				D = math.min(need, Config.DashMaxDistance)
-			end
-		else
-			-- BEAM: V_evasion = V_beam x Vector3.yAxis, в сторону от оси луча
-			local rx, ry, rz = mx - rec.ox, my - rec.oy, mz - rec.oz
-			local t = rx * rec.ax + ry * rec.ay + rz * rec.az
-			if t < 0 then
-				t = 0
-			elseif t > rec.blen then
-				t = rec.blen
-			end
-			local qx, qy, qz = rx - rec.ax * t, ry - rec.ay * t, rz - rec.az * t
-			local dist = math.sqrt(qx * qx + qy * qy + qz * qz)
-			local hs2 = rec.ax * rec.ax + rec.az * rec.az
-			if hs2 >= 0.01 then
-				local hs = math.sqrt(hs2)
-				local ux, uz = rec.ax / hs, rec.az / hs
-				local sx, sz = -uz, ux
-				local pref = (qx * sx + qz * sz) >= 0 and 1 or -1
-				addCand(sx * pref, sz * pref, -2.0)
-				addCand(-sx * pref, -sz * pref, -0.6)
-			else
-				addCand(qx, qz, -2.0)
-				addCand(-look.X, -look.Z, -0.5)
-			end
-			local need = rec.lim - dist + 1.5
-			if need > D then
-				D = math.min(need, Config.DashMaxDistance)
-			end
-		end
-	end
-
-	local dur = math.max(Config.DashDuration, D / Config.DashAvgSpeed)
-	local repeatActive = now - c.lastDirTime < 1.6
-	for i = 1, candN do
-		local cx, cz = candX[i], candZ[i]
-		local sc = candBonus[i]
-		if repeatActive and cx * c.lastDirX + cz * c.lastDirZ > 0.7 then
-			sc += 0.35 -- не повторяем одно и то же движение подряд
-		end
-		for k = 1, activeN do
-			local rec = active[k]
-			local kind = rec.kind
-			local clearance, R
-			if kind == "Proj" then
-				clearance = projClearance(rec, cx, cz, D, dur, delay, mx, my, mz, grav)
-				R = rec.hitR
-			elseif kind == "AOE" then
-				clearance = aoeClearance(rec, cx, cz, D, dur, delay, mx, my, mz)
-				R = rec.safeR
-			else
-				clearance = beamClearance(rec, cx, cz, D, dur, delay, mx, my, mz)
-				R = rec.lim
-			end
-			local urgency = math.min(6, 1.5 / (0.25 + rec.tti))
-			if clearance < 0 then
-				sc += math.min(1, -clearance / R) * urgency
-			else
-				sc -= math.min(0.4, clearance / R * 0.2)
-			end
-		end
-		candScore[i] = sc
-	end
-
-	-- выбор лучшего с валидацией. Упёрлись в стену или пустоту: поощряем противоположное
-	-- и противоположно-диагональные направления (dot <= -0.7).
-	local chosen, chosenDist = 0, 0
-	for _ = 1, 12 do
-		local bi, bs = 0, math.huge
-		for i = 1, candN do
-			if not candUsed[i] and candScore[i] < bs then
-				bi, bs = i, candScore[i]
-			end
-		end
-		if bi == 0 then
-			break
-		end
-		candUsed[bi] = true
-		local d = validateDir(candX[bi], candZ[bi], D)
-		if d then
-			chosen, chosenDist = bi, d
-			break
-		end
-		local fx, fz = candX[bi], candZ[bi]
-		for j = 1, candN do
-			if not candUsed[j] and candX[j] * fx + candZ[j] * fz <= -0.7 then
-				candScore[j] -= 2
-			end
-		end
-	end
-
-	if chosen == 0 then
-		for i = 1, activeN do
-			active[i].handledUntil = now + 0.3
-		end
-		return
-	end
-
-	if Config.WalkDodge and urgentMin >= Config.WalkDodgeTTI then
-		-- запас времени есть: человек сначала просто шагает в сторону, рывок включится, если шаг не помог
-		startManeuver(now, candX[chosen], candZ[chosen], MV_DODGE, urgentMin + 0.25)
-		for i = 1, activeN do
-			active[i].handledUntil = now + 0.14
-		end
-		return
-	end
-
-	for i = 1, activeN do
-		active[i].handledUntil = now + 0.6
-	end
-	startDash(now, candX[chosen], candZ[chosen], chosenDist)
-end
-
-local function step(now)
-	local c = ctx
-	if c.dashing or now < c.settleUntil then
-		return
-	end
-	ScanForThreats(now)
-	evaluate(now)
-	if activeN == 0 then
-		Ctl.pendingDodgeAt = 0
-		return
-	end
-	dangerUntil = now + 0.4
-	if now + 0.6 > Ctl.threatUntil then
-		Ctl.threatUntil = now + 0.6
-	end
-	if now < c.cooldownEnd then
-		return
-	end
-	-- микро-задержка реакции 50-120 мс: решение откладывается, а не принимается "по предсказанию"
-	if now >= Ctl.noDelayUntil then
-		if Ctl.pendingDodgeAt == 0 then
-			Ctl.pendingDodgeAt = now + rng:NextNumber(Config.ReactionMinMs, Config.ReactionMaxMs) / 1000
-			return
-		end
-		if now < Ctl.pendingDodgeAt then
-			return
-		end
-		Ctl.pendingDodgeAt = 0
-		Ctl.noDelayUntil = now + 0.7
-	end
-	local reason = guardReason()
-	if reason then
-		cachedReason = reason
-		return
-	end
-	decide(now)
-end
-
--- =====================================================================
--- ВРАГИ: список, кинематика, чтение атак и ритма
--- =====================================================================
-local function enemyAllowed(model, plr)
-	if Config.IsEnemy then
-		local ok, r = pcall(Config.IsEnemy, model, plr)
-		if ok then
-			return r and true or false
-		end
-	end
-	if plr then
-		if plr == LocalPlayer then
-			return false
-		end
-		if not Config.IncludeTeammates and LocalPlayer.Team ~= nil and plr.Team == LocalPlayer.Team then
-			return false
-		end
-	end
-	return true
-end
-
-local function addEnemy(model, plr)
-	local hum = model:FindFirstChildOfClass("Humanoid")
-	if not hum or hum.Health <= 0 then
-		return
-	end
-	local root = hum.RootPart
-	if not root then
-		return
-	end
-	local e = enemyMap[model]
-	if not e then
-		e = {
-			model = model, hum = hum, root = root, plr = plr, animator = nil,
-			dist = 1e9, px = 0, pz = 0, vx = 0, vz = 0, lx = 0, lz = 1, ox = 0, oz = 1,
-			face = 0, closing = 0,
-			attackActive = false, lastAttackStart = -10, attackLen = 0, interval = 0,
-			counterUntil = 0, counterFired = true, nextPoll = 0, dodgedAt = -99, seen = 0,
-		}
-		enemyMap[model] = e
-	end
-	e.hum, e.root = hum, root
-	e.seen = epoch
-	enemyN += 1
-	enemyList[enemyN] = e
-end
-
-local function refreshEnemies()
-	epoch += 1
-	enemyN = 0
-	local me = ctx.char
-	for _, plr in ipairs(Players:GetPlayers()) do
-		local ch = plr.Character
-		if ch and ch ~= me and enemyAllowed(ch, plr) then
-			addEnemy(ch, plr)
-		end
-	end
-	local folder = Config.NpcFolder
-	if folder then
-		for _, m in ipairs(folder:GetChildren()) do
-			if m:IsA("Model") and m ~= me and enemyAllowed(m, nil) then
-				addEnemy(m, nil)
-			end
-		end
-	end
-	for model, e in pairs(enemyMap) do
-		if e.seen ~= epoch then
-			enemyMap[model] = nil
-		end
-	end
-	for i = enemyN + 1, #enemyList do
-		enemyList[i] = nil
-	end
-end
-
--- Атака врага = новая не зацикленная анимация с приоритетом Action..Action4 (Core/Idle/Movement не считаются)
-local function pollEnemyAttack(e, now)
-	if now < e.nextPoll then
-		return
-	end
-	e.nextPoll = now + 0.1
-	local animator = e.animator
-	if not animator or animator.Parent == nil then
-		animator = e.hum:FindFirstChildOfClass("Animator")
-		e.animator = animator
-		if not animator then
-			return
-		end
-	end
-	local tracks = animator:GetPlayingAnimationTracks()
-	local attackingNow = false
-	for i = 1, #tracks do
-		local tr = tracks[i]
-		local pv = tr.Priority.Value
-		if pv >= 2 and pv <= 5 and not tr.Looped and tr.Length > 0.15 then
-			attackingNow = true
-			if not seenTracks[tr] then
-				seenTracks[tr] = true
-				if e.lastAttackStart > 0 then
-					local iv = now - e.lastAttackStart
-					if iv > 0.2 and iv < 4 then
-						e.interval = (e.interval > 0) and (e.interval * 0.6 + iv * 0.4) or iv -- ритм атак врага
-					end
-				end
-				e.lastAttackStart = now - tr.TimePosition
-				e.attackLen = tr.Length / math.max(tr.Speed, 0.1)
-				e.attackActive = true
-			end
-		end
-	end
-	if not attackingNow and e.attackActive then
-		e.attackActive = false
-		e.counterUntil = now + Config.CounterWindow -- враг в восстановлении: окно контратаки
-		e.counterFired = false
-	end
-end
-
-local function updateEnemies(now, mx, mz)
-	local polled = 0
-	local far = Config.ConflictRange + 4
-	for i = 1, enemyN do
-		local e = enemyList[i]
-		local root = e.root
-		if root.Parent == nil or e.hum.Health <= 0 then
-			e.dist = 1e9
-			e.attackActive = false
-		else
-			local p = root.Position
-			local v = root.AssemblyLinearVelocity
-			local look = root.CFrame.LookVector
-			e.px, e.pz = p.X, p.Z
-			e.vx, e.vz = v.X, v.Z
-			local lh = math.sqrt(look.X * look.X + look.Z * look.Z)
-			if lh > 1e-3 then
-				e.lx, e.lz = look.X / lh, look.Z / lh
-			end
-			local dx, dz = mx - e.px, mz - e.pz -- от врага к нам
-			local d = math.sqrt(dx * dx + dz * dz)
-			if d < 0.05 then
-				d = 0.05
-			end
-			e.dist = d
-			e.ox, e.oz = dx / d, dz / d
-			e.face = e.lx * e.ox + e.lz * e.oz       -- >0: враг смотрит на нас
-			e.closing = e.vx * e.ox + e.vz * e.oz    -- >0: враг приближается
-			if d <= far then
-				if polled < 3 then
-					polled += 1
-					pollEnemyAttack(e, now)
-				end
-			else
-				e.attackActive = false
-			end
-		end
-	end
-end
-
-local function pickTarget()
-	local best, bd = nil, Config.ConflictRange
-	for i = 1, enemyN do
-		local e = enemyList[i]
-		if e.dist < bd then
-			best, bd = e, e.dist
-		end
-	end
-	local cur = target
-	if cur and cur.seen == epoch and cur.dist <= Config.ConflictRange and best and best ~= cur then
-		if best.dist > cur.dist * 0.8 then
-			best = cur -- гистерезис: не дёргаемся между целями
-		end
-	end
-	target = best
-	return best
-end
-
--- =====================================================================
--- ОКРУЖЕНИЕ: рейкасты, рулёжка, антизалипание
--- =====================================================================
-local function castSurroundings()
-	local c = ctx
-	local origin = c.hrp.Position
-	local down = -AXIS_Y * Config.VoidCheckDepth
-	local params = c.rayParams
-	for i = 1, N_DIR do
-		local cx, cz = baseCos[i], baseSin[i]
-		local dir = AXIS_X * cx + AXIS_Z * cz
-		local r = Workspace:Raycast(origin, dir * RAY_LEN, params)
-		local clear = 1
-		if r then
-			clear = r.Distance / RAY_LEN
-		end
-		rayClear[i] = clear
-		rayVoid[i] = false
-		-- пропасть проверяем только если стена не раньше точки проверки
-		if clear * RAY_LEN > 5.5 then
-			if not Workspace:Raycast(origin + dir * 5, down, params) then
-				rayVoid[i] = true
-			end
-		end
-	end
-end
-
--- контекстное рулёжное управление: желаемое направление + стены/пропасти -> безопасное направление
-local function contextSteer(wx, wz)
-	local wm = math.sqrt(wx * wx + wz * wz)
-	if wm < 1e-4 then
-		return 0, 0
-	end
-	wx, wz = wx / wm, wz / wm
-	local sx, sz = 0, 0
-	local bestClear, bestI = -1, 1
-	local orbit = Ctl.orbitDir
-	for i = 1, N_DIR do
-		local cx, cz = baseCos[i], baseSin[i]
-		local clear = rayClear[i]
-		local danger = 0
-		if rayVoid[i] then
-			clear = 0
-			danger = 1
-		elseif clear < 0.75 then
-			danger = (0.75 - clear) / 0.75
-		end
-		if clear > bestClear then
-			bestClear, bestI = clear, i
-		end
-		local align = cx * wx + cz * wz
-		local cross = wx * cz - wz * cx
-		-- небольшое предпочтение стороны орбиты разбивает симметрию при упоре в стену
-		local score = align - danger * 1.6 + 0.15 * orbit * cross * (danger > 0 and 1 or 0)
-		if score > 0 then
-			sx += cx * score
-			sz += cz * score
-		end
-	end
-	local sm = math.sqrt(sx * sx + sz * sz)
-	if sm < 0.05 then
-		return baseCos[bestI], baseSin[bestI] -- всё впереди закрыто: идём по самому свободному направлению
-	end
-	return sx / sm, sz / sm
-end
-
-local function stuckCheck(now, mx, mz)
-	if now - Ctl.stuckT < 0.4 then
-		return
-	end
-	local dx, dz = mx - Ctl.stuckX, mz - Ctl.stuckZ
-	local moved = math.sqrt(dx * dx + dz * dz)
-	Ctl.stuckT, Ctl.stuckX, Ctl.stuckZ = now, mx, mz
-	if Ctl.speed > 0.55 and moved < 0.9 and not ctx.dashing and now > Ctl.unstickUntil then
-		-- залипли: уходим вдоль самой свободной стороны, не совпадающей с текущим курсом
-		local hx, hz = math.cos(Ctl.heading), math.sin(Ctl.heading)
-		local bestI, bestS = 1, -9
-		for i = 1, N_DIR do
-			local clear = rayVoid[i] and 0 or rayClear[i]
-			local s = clear - 0.6 * math.max(0, baseCos[i] * hx + baseSin[i] * hz)
-			if s > bestS then
-				bestS, bestI = s, i
-			end
-		end
-		Ctl.unstickX, Ctl.unstickZ = baseCos[bestI], baseSin[bestI]
-		Ctl.unstickUntil = now + 0.5
-		Ctl.orbitDir = -Ctl.orbitDir
-		Ctl.feintPhase = 0
-		Ctl.flankUntil = 0
-	end
-end
-
--- =====================================================================
--- ТАКТИКА И ГУМАНИЗАЦИЯ
--- =====================================================================
--- рваный темп: нерегулярные провалы/всплески скорости + медленный шум
-local function humanScale(now)
-	if now >= Ctl.nextStutterAt then
-		Ctl.nextStutterAt = now + rng:NextNumber(0.35, 1.2)
-		if rng:NextNumber() < 0.55 then
-			Ctl.stutterUntil = now + rng:NextNumber(0.07, 0.16)
-			Ctl.stutterScale = rng:NextNumber(0.2, 0.55)
-		else
-			Ctl.stutterUntil = now + rng:NextNumber(0.1, 0.22)
-			Ctl.stutterScale = 1
-		end
-	end
-	local s = 1
-	if now < Ctl.stutterUntil then
-		s = Ctl.stutterScale
-	end
-	local n = math.noise(now * 1.7, Ctl.noiseSeed)
-	local k = 0.88 + 0.2 * n
-	if k > 1 then
-		k = 1
-	end
-	return s * k
-end
-
-local function flankSideFor(e)
-	-- cross(L, R) > 0: мы на CCW-стороне от взгляда врага, до его спины короче идти против часовой (= -t)
-	local cross = e.lx * e.oz - e.lz * e.ox
-	return cross > 0 and -1 or 1
-end
-
-local function flankMove(e, mx, mz, ux, uz, tx, tz, dist, side)
-	local bx = e.px - e.lx * Config.OptimalMin * 0.9
-	local bz = e.pz - e.lz * Config.OptimalMin * 0.9
-	local gx, gz = bx - mx, bz - mz
-	local gl = math.sqrt(gx * gx + gz * gz)
-	if gl < 1e-3 then
-		return 0, 0
-	end
-	local k = math.min(1, gl / 10)
-	local wx = gx / gl * 0.8 + tx * side * 0.6 * k -- путь дугой, а не прямой
-	local wz = gz / gl * 0.8 + tz * side * 0.6 * k
-	if dist < Config.OptimalMin - 1 then
-		wx -= ux * 0.8
-		wz -= uz * 0.8
-	end
-	return wx, wz
-end
-
--- возвращает желаемое направление (до рулёжки), силу стика и скорость поворота
-local function tactics(now, dt, mx, mz, e)
-	local dist = e.dist
-	local ux, uz = -e.ox, -e.oz -- от нас к врагу
-	local tx, tz = -uz, ux      -- касательная
-	local opt0, opt1 = Config.OptimalMin, Config.OptimalMax
-	local turnN, turnE = Config.TurnRateNormal, Config.TurnRateEmergency
-
-	-- 1) финт (байт): ложный шаг в одну сторону -> резкий уход в другую
-	if Ctl.feintPhase == 1 then
-		if now < Ctl.feintUntil then
-			return tx * Ctl.feintSide * 0.95 + ux * 0.2, tz * Ctl.feintSide * 0.95 + uz * 0.2, 1, turnN
-		end
-		Ctl.feintPhase = 2
-		Ctl.feintUntil = now + rng:NextNumber(0.25, 0.42)
-		Ctl.orbitDir = -Ctl.feintSide
-	end
-	if Ctl.feintPhase == 2 then
-		if now < Ctl.feintUntil then
-			return tx * Ctl.orbitDir * 0.9 + ux * 0.55, tz * Ctl.orbitDir * 0.9 + uz * 0.55, 1, turnE
-		end
-		Ctl.feintPhase = 0
-		Ctl.feintCooldown = now + rng:NextNumber(2.2, 4.5)
-	end
-	if Ctl.feintPhase == 0 and now >= Ctl.feintCooldown and not e.attackActive and e.face > 0.3
-		and dist >= opt0 - 1 and dist <= opt1 + 6 then
-		-- чем быстрее враг сокращает дистанцию, тем вероятнее финт
-		local chance = Config.FeintChancePerSec * dt * (1 + math.max(0, e.closing) / 8)
-		if rng:NextNumber() < chance then
-			Ctl.feintPhase = 1
-			Ctl.feintUntil = now + rng:NextNumber(0.12, 0.2)
-			Ctl.feintSide = rng:NextNumber() < 0.5 and 1 or -1
-		end
-	end
-
-	-- 2) окно контратаки: враг в восстановлении, занимаем позицию за спиной/сбоку
-	if now < e.counterUntil then
-		if not e.counterFired and dist <= Config.EnemyAttackRange + 3 then
-			e.counterFired = true
-			if Config.OnCounterWindow then
-				pcall(Config.OnCounterWindow, e.model)
-			end
-		end
-		local wx, wz = flankMove(e, mx, mz, ux, uz, tx, tz, dist, flankSideFor(e))
-		return wx, wz, 1, turnN
-	end
-
-	-- 3) обход в мёртвую зону за спину
-	if now < Ctl.flankUntil then
-		if (e.face < -0.35 and dist <= opt0 + 3) or e.attackActive then
-			Ctl.flankUntil = 0
-		else
-			local wx, wz = flankMove(e, mx, mz, ux, uz, tx, tz, dist, Ctl.flankSide)
-			return wx, wz, 1, turnN
-		end
-	elseif Config.FlankEnabled and now >= Ctl.nextFlankAt and not e.attackActive
-		and dist >= opt0 - 2 and dist <= opt1 + 4 then
-		local chance = (e.face < 0.2) and 1.2 or 0.22 -- если враг отвернулся — заходим почти сразу
-		if rng:NextNumber() < chance * dt then
-			Ctl.flankSide = flankSideFor(e)
-			Ctl.flankUntil = now + rng:NextNumber(1.6, 2.6)
-			Ctl.nextFlankAt = now + rng:NextNumber(5, 9)
-		end
-	end
-
-	-- 4) орбитальный стрейф с удержанием оптимальной дистанции
-	if now >= Ctl.nextFlipAt then
-		Ctl.nextFlipAt = now + rng:NextNumber(0.7, 2.1) -- смена стороны в нерегулярные моменты
-		Ctl.orbitDir = -Ctl.orbitDir
-		Ctl.stutterUntil = now + 0.09 -- микро-пауза на развороте
-		Ctl.stutterScale = 0.3
-	end
-	local rad = 0
-	if dist > opt1 then
-		rad = math.min(1, (dist - opt1) / 6)
-	elseif dist < opt0 then
-		rad = -math.min(1, (opt0 - dist) / 4)
-	else
-		rad = 0.25 * math.noise(now * 0.9, Ctl.noiseSeed + 11)
-	end
-	-- упреждающий отход перед ожидаемой атакой по ритму врага
-	if e.interval > 0 and not e.attackActive and now > e.lastAttackStart + e.interval - 0.3
-		and dist < Config.EnemyAttackRange + 4 then
-		rad = math.min(rad, -0.8)
-	end
-	local tan = 0.65 + 0.35 * (math.noise(now * 0.6, Ctl.noiseSeed + 23) + 0.5)
-	local wx = ux * rad + tx * Ctl.orbitDir * tan
-	local wz = uz * rad + tz * Ctl.orbitDir * tan
-	return wx, wz, humanScale(now), turnN
-end
-
--- уклонение от ближней атаки: шаг вбок со сдвигом назад, при нехватке времени — рывок
-local function meleeEvade(now, mx, mz, e, remaining)
-	local sx, sz = -e.lz, e.lx -- V_look x yAxis
-	local lat = (mx - e.px) * sx + (mz - e.pz) * sz
-	local pref = lat >= 0 and 1 or -1
-	if rng:NextNumber() < Config.EvadeSideRandom then
-		pref = -pref -- иногда неожиданная сторона
-	end
-	local ax, az = sx * pref * 0.9 + e.ox * 0.5, sz * pref * 0.9 + e.oz * 0.5
-	local bx, bz = -sx * pref * 0.9 + e.ox * 0.5, -sz * pref * 0.9 + e.oz * 0.5
-	local am = math.sqrt(ax * ax + az * az)
-	local bm = math.sqrt(bx * bx + bz * bz)
-	ax, az, bx, bz = ax / am, az / am, bx / bm, bz / bm
-	local ia, ib = slotOf(ax, az), slotOf(bx, bz)
-	local ca = rayVoid[ia] and 0 or rayClear[ia]
-	local cb = rayVoid[ib] and 0 or rayClear[ib]
-	local dx, dz, best = ax, az, ca
-	if cb > ca then
-		dx, dz, best = bx, bz, cb
-	end
-	if best < 0.45 then
-		dx, dz = e.ox, e.oz -- обе стороны закрыты: отходим от врага
-	end
-	startManeuver(now, dx, dz, MV_MELEE, 0.4)
-	local c = ctx
-	if remaining <= Config.MeleeDashLead and now >= c.cooldownEnd and not c.dashing then
-		local free = validateDir(dx, dz, Config.MeleeDashDistance)
-		if free then
-			startDash(now, dx, dz, free)
-		end
-	end
-end
-
-local function checkMelee(now, mx, mz)
-	for i = 1, enemyN do
-		local e = enemyList[i]
-		if e.attackActive and e.dist <= Config.EnemyAttackRange + 2 and e.face >= 0.4 and e.dodgedAt ~= e.lastAttackStart then
-			local hitAt = e.lastAttackStart + math.clamp(e.attackLen * Config.AttackHitFrac, 0.15, 0.6)
-			local remaining = hitAt - now
-			if remaining > -0.08 and remaining <= Config.MeleeReactWindow then
-				if Ctl.meleeReactAt == 0 or Ctl.meleeFor ~= e then
-					Ctl.meleeFor = e
-					Ctl.meleeReactAt = now + rng:NextNumber(Config.ReactionMinMs, Config.ReactionMaxMs) / 1000
-				end
-				if now >= Ctl.meleeReactAt then
-					Ctl.meleeReactAt = 0
-					e.dodgedAt = e.lastAttackStart
-					meleeEvade(now, mx, mz, e, remaining)
-				end
-				return
-			end
-		end
-	end
-	Ctl.meleeReactAt = 0
-end
-
--- =====================================================================
--- УПРАВЛЕНИЕ ПЕРСОНАЖЕМ: захват/возврат, поворот на врага, мозг, применение движения
--- =====================================================================
-local function setFacing(on)
-	if on == Ctl.facing then
-		return
-	end
-	Ctl.facing = on
-	local hum = ctx.hum
-	if on then
-		if hum then
-			Ctl.prevAutoRotate = hum.AutoRotate
-			hum.AutoRotate = false
-		end
-		if ctx.ao then
-			ctx.ao.Enabled = true
-		end
-	else
-		if hum then
-			hum.AutoRotate = Ctl.prevAutoRotate
-		end
-		if ctx.ao then
-			ctx.ao.Enabled = false
-		end
-	end
-end
-
-local function setControl(want)
-	if want == Ctl.active then
-		return
-	end
-	Ctl.active = want
-	if want then
-		local hum = ctx.hum
-		if hum then
-			local md = hum.MoveDirection
-			if md.Magnitude > 0.1 then
-				Ctl.heading = math.atan2(md.Z, md.X)
-			end
-		end
-		Ctl.speed = 0
-	else
-		setFacing(false)
-		Ctl.speed = 0
-		Ctl.wantSpeed = 0
-	end
-end
-
-local function brain(now, dt)
-	local c = ctx
-	local hrp = c.hrp
-	if not hrp then
-		return
-	end
-	local p = hrp.Position
-	local mx, mz = p.X, p.Z
-
-	if now >= Ctl.nextEnemyRefresh then
-		Ctl.nextEnemyRefresh = now + 0.25
-		refreshEnemies()
-	end
-	updateEnemies(now, mx, mz)
-	local e = pickTarget()
-
-	local want = Enabled and cachedReason == nil and (Ctl.mvActive or now < Ctl.threatUntil or e ~= nil)
-	setControl(want)
-	if not Ctl.active then
-		return
-	end
-
-	castSurroundings()
-	checkMelee(now, mx, mz)
-
-	if Ctl.mvActive and now >= Ctl.mvUntil then
-		Ctl.mvActive = false
-	end
-
-	local wx, wz, spd, turn = 0, 0, 0, Config.TurnRateNormal
-	if now < Ctl.unstickUntil then
-		wx, wz, spd, turn = Ctl.unstickX, Ctl.unstickZ, 1, Config.TurnRateEmergency
-	elseif Ctl.mvActive then
-		wx, wz, spd = Ctl.mvX, Ctl.mvZ, Ctl.mvSpeed
-		turn = Config.TurnRateEmergency
-	elseif e then
-		wx, wz, spd, turn = tactics(now, dt, mx, mz, e)
-	end
-
-	local sx, sz = 0, 0
-	if spd > 0 then
-		sx, sz = contextSteer(wx, wz)
-	end
-	if sx == 0 and sz == 0 then
-		spd = 0
-	end
-	Ctl.wantX, Ctl.wantZ, Ctl.wantSpeed, Ctl.wantTurn = sx, sz, spd, turn
-
-	stuckCheck(now, mx, mz)
-
-	-- корпус смотрит на врага (человек в бою не бегает спиной вперёд "в никуда")
-	local face = Config.FaceEnemy and e ~= nil and c.ao ~= nil
-	setFacing(face)
-	if face then
-		c.ao.CFrame = CFrame.lookAt(ZERO, AXIS_X * (e.px - mx) + AXIS_Z * (e.pz - mz))
-	end
-end
-
-local controlsObj = nil
-local function readManual()
-	if controlsObj == nil then
-		local ok, res = pcall(function()
-			return require(LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule", 2)):GetControls()
-		end)
-		controlsObj = (ok and res) or false
-	end
-	if controlsObj then
-		local mv = controlsObj:GetMoveVector()
-		return mv.X * mv.X + mv.Z * mv.Z > 0.09
-	end
-	return false
-end
-
--- вызывается в RenderStep после ввода игрока: плавный вектор "стика" вместо мгновенных разворотов
-local function applyMove(dt)
-	if not Ctl.active then
-		return
-	end
-	local hum = ctx.hum
-	if not hum or hum.Parent == nil then
-		return
-	end
-	if Config.ManualOverride and not Config.NpcModel and readManual() then
-		return
-	end
-
-	local ws = Ctl.wantSpeed
-	local wx, wz = Ctl.wantX, Ctl.wantZ
-	local s = Ctl.speed
-	local h = Ctl.heading
-	local tgt = 0
-
-	if ws > 0.02 then
-		local dhFull = (math.atan2(wz, wx) - h + math.pi) % TAU - math.pi
-		local dh = dhFull
-		if s < 0.12 then
-			h = h + dh -- с места направление выбирается сразу
-		else
-			local maxStep = Ctl.wantTurn * DEG * dt
-			if dh > maxStep then
-				dh = maxStep
-			elseif dh < -maxStep then
-				dh = -maxStep
-			end
-			h = h + dh
-		end
-		-- на крутом повороте человек немного сбавляет темп
-		tgt = ws * (1 - 0.35 * math.min(1, math.abs(dhFull) / math.pi))
-	end
-
-	if tgt > s then
-		s = math.min(tgt, s + Config.SpeedAccel * dt)
-	else
-		s = math.max(tgt, s - Config.SpeedDecel * dt)
-	end
-	h = (h + math.pi) % TAU - math.pi
-	Ctl.heading, Ctl.speed = h, s
-
-	hum:Move(AXIS_X * (math.cos(h) * s) + AXIS_Z * (math.sin(h) * s), false)
-end
-
--- =====================================================================
--- СОСТОЯНИЕ, HEARTBEAT
--- =====================================================================
-local function updateState(now)
-	local new
-	if not Enabled then
-		new = "Disabled"
-	elseif cachedReason then
-		new = "Blocked"
-	elseif ctx.dashing then
-		new = "Evading"
-	elseif Ctl.active then
-		new = "Combat"
-	elseif now < ctx.cooldownEnd then
-		new = "Cooldown"
-	else
-		new = "Idle"
-	end
-	if new ~= fsm then
-		fsm = new
-		LocalPlayer:SetAttribute("AutoEvasionState", fsm)
-	end
-end
-
-local guardAcc, pingAcc, brainAcc = 0, 0, 0
-
-local function onHeartbeat(dt)
-	local c = ctx
-	if not c.hrp then
-		return
-	end
-	local now = os.clock()
-	frame += 1
-
-	if c.dashing then
-		local lv = c.lv
-		local el = now - c.dashStart
-		if el >= c.dashDur or not lv or not lv.Parent or c.hum.Health <= 0 or cachedReason or not Enabled then
-			endDash()
-		else
-			local tau = el / c.dashDur
-			lv.VectorVelocity = c.dashDir * (c.dashPeak * (1 - tau * tau))
-		end
-	end
-
-	pingAcc += dt
-	if pingAcc >= 0.25 then
-		pingAcc = 0
-		updatePing()
-	end
-
-	guardAcc += dt
-	if guardAcc >= 0.1 then
-		guardAcc = 0
-		cachedReason = guardReason()
-	end
-
-	if not Enabled or cachedReason then
-		if Ctl.active then
-			setControl(false)
-		end
-		updateState(now)
-		return
-	end
-
-	-- адаптивная частота скана: каждый 2-й кадр в спокойствии, каждый кадр при опасности
-	local every = Config.CalmScanEvery
-	if now < dangerUntil then
-		every = Config.DangerScanEvery
-	end
-	if frame % every == 0 then
-		step(now)
-	end
-
-	brainAcc += dt
-	if brainAcc >= 1 / Config.BrainHz then
-		local bdt = brainAcc
-		brainAcc = 0
-		brain(now, bdt)
-	end
-
-	updateState(now)
-end
-
--- =====================================================================
--- ПЕРСОНАЖ / NPC
--- =====================================================================
-local function teardownCharacter()
-	local c = ctx
-	setControl(false)
-	for i = #c.conns, 1, -1 do
-		c.conns[i]:Disconnect()
-		c.conns[i] = nil
-	end
-	c.dashing = false
-	if c.lv then
-		c.lv:Destroy()
-	end
-	if c.ao then
-		c.ao:Destroy()
-	end
-	if c.att then
-		c.att:Destroy()
-	end
-	c.lv, c.ao, c.att = nil, nil, nil
-	c.char, c.hum, c.hrp = nil, nil, nil
-	c.rayParams, c.overlapParams = nil, nil
-	c.cooldownEnd = 0
-	c.settleUntil = 0
-	Ctl.mvActive = false
-	Ctl.facing = false
-	Ctl.pendingDodgeAt = 0
-	target = nil
-	clearThreats()
-	cachedReason = "NoCharacter"
-end
-
-local function onCharacter(char)
-	teardownCharacter()
-	local hum = char:WaitForChild("Humanoid", 10)
-	local hrp = char:WaitForChild("HumanoidRootPart", 10)
-	if not hum or not hrp or getTarget() ~= char then
-		return
-	end
-	local c = ctx
-	c.char, c.hum, c.hrp = char, hum, hrp
-
-	local ray = RaycastParams.new()
-	ray.FilterType = Enum.RaycastFilterType.Exclude
-	ray.FilterDescendantsInstances = { char }
-	ray.RespectCanCollide = true
-	c.rayParams = ray
-
-	local ov = OverlapParams.new()
-	ov.FilterType = Enum.RaycastFilterType.Exclude
-	ov.FilterDescendantsInstances = { char }
-	ov.MaxParts = Config.MaxScanParts
-	ov.RespectCanCollide = false
-	c.overlapParams = ov
-
-	local att = Instance.new("Attachment")
-	att.Name = "AutoEvadeAttachment"
-	att.Parent = hrp
-
-	local lv = Instance.new("LinearVelocity")
-	lv.Name = "AutoEvadeDash"
-	lv.Attachment0 = att
-	lv.RelativeTo = Enum.ActuatorRelativeTo.World
-	lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
-	lv.ForceLimitMode = Enum.ForceLimitMode.PerAxis
-	lv.MaxAxesForce = Vector3.new(Config.DashForce, 0, Config.DashForce)
-	lv.VectorVelocity = Vector3.zero
-	lv.Enabled = false
-	lv.Parent = hrp
-
-	local ao = Instance.new("AlignOrientation")
-	ao.Name = "AutoMansFacing"
-	ao.Mode = Enum.OrientationAlignmentMode.OneAttachment
-	ao.Attachment0 = att
-	ao.RigidityEnabled = false
-	ao.MaxTorque = 1e5
-	ao.Responsiveness = 25
-	ao.Enabled = false
-	ao.Parent = hrp
-
-	c.att, c.lv, c.ao = att, lv, ao
-
-	c.conns[#c.conns + 1] = hum.Died:Connect(function()
-		endDash()
-		clearThreats()
-		cachedReason = "Dead"
-		setControl(false)
-	end)
-	c.conns[#c.conns + 1] = char.AncestryChanged:Connect(function()
-		if not char:IsDescendantOf(game) and ctx.char == char then
-			teardownCharacter()
-		end
-	end)
-
-	cachedReason = nil
-	pingAcc = 1
-	Ctl.nextEnemyRefresh = 0
-	dbg("target ready")
-end
-
--- =====================================================================
--- ПЕРЕКЛЮЧАТЕЛЬ ВКЛ/ВЫКЛ
--- =====================================================================
-local function setEnabled(v)
-	if Enabled == v then
-		return
-	end
-	Enabled = v
-	LocalPlayer:SetAttribute("AutoEvasionEnabled", v)
-	if not v then
-		endDash()
-		clearThreats()
-		Ctl.mvActive = false
-		Ctl.pendingDodgeAt = 0
-		setControl(false)
-	end
-	if refreshUI then
-		refreshUI(true)
-	end
-end
-
--- =====================================================================
--- ЗАЩИЩЁННЫЙ UI-ТУМБЛЕР
--- =====================================================================
-local COLOR_ON_BG = Color3.fromRGB(14, 52, 40)
-local COLOR_OFF_BG = Color3.fromRGB(46, 22, 28)
-local COLOR_ON = Color3.fromRGB(70, 255, 170)
-local COLOR_OFF = Color3.fromRGB(255, 85, 95)
-local TWEEN_FAST = TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
-
-local UI = {
-	gui = nil, button = nil, title = nil, status = nil, stroke = nil, dot = nil, scale = nil,
-	conns = {},
-	building = false,
-	validateQueued = false,
-	savedPos = UDim2.new(1, -52, 0.45, 0),
-	rebuildStamps = {},
-}
-
-function refreshUI(animate)
-	local b = UI.button
-	if not b or not UI.status or not UI.stroke or not UI.dot then
-		return
-	end
-	local on = Enabled
-	local bg = on and COLOR_ON_BG or COLOR_OFF_BG
-	local accent = on and COLOR_ON or COLOR_OFF
-	UI.status.Text = on and "ON" or "OFF"
-	if animate then
-		TweenService:Create(b, TWEEN_FAST, { BackgroundColor3 = bg }):Play()
-		TweenService:Create(UI.stroke, TWEEN_FAST, { Color = accent }):Play()
-		TweenService:Create(UI.status, TWEEN_FAST, { TextColor3 = accent }):Play()
-		TweenService:Create(UI.dot, TWEEN_FAST, { BackgroundColor3 = accent }):Play()
-	else
-		b.BackgroundColor3 = bg
-		UI.stroke.Color = accent
-		UI.status.TextColor3 = accent
-		UI.dot.BackgroundColor3 = accent
-	end
-end
-
-local function disconnectUI()
-	for i = #UI.conns, 1, -1 do
-		UI.conns[i]:Disconnect()
-		UI.conns[i] = nil
-	end
-end
-
-local function destroyUI()
-	disconnectUI()
-	local old = UI.gui
-	UI.gui, UI.button, UI.title, UI.status, UI.stroke, UI.dot, UI.scale = nil, nil, nil, nil, nil, nil, nil
-	if old then
-		pcall(function()
-			old:Destroy()
-		end)
-	end
-end
-
-local buildUI -- forward declaration
-
-local function validateUI()
-	if UI.building then
-		return
-	end
-	local gui, button = UI.gui, UI.button
-	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-	local intact = gui ~= nil and button ~= nil and playerGui ~= nil
-		and gui.Parent == playerGui
-		and button.Parent == gui
-		and UI.title ~= nil and UI.title.Parent == button
-		and UI.status ~= nil and UI.status.Parent == button
-		and UI.stroke ~= nil and UI.stroke.Parent == button
-		and UI.dot ~= nil and UI.dot.Parent == button
-	if not intact then
-		local now = os.clock()
-		local stamps = UI.rebuildStamps
-		for i = #stamps, 1, -1 do
-			if now - stamps[i] > 2 then
-				table.remove(stamps, i)
-			end
-		end
-		stamps[#stamps + 1] = now
-		if #stamps > 8 then
-			task.wait(0.5)
-		end
-		buildUI()
-		return
-	end
-	if not gui.Enabled then
-		gui.Enabled = true
-	end
-	if not button.Visible then
-		button.Visible = true
-	end
-end
-
-local function queueValidate()
-	if UI.validateQueued then
-		return
-	end
-	UI.validateQueued = true
-	task.defer(function()
-		UI.validateQueued = false
-		validateUI()
-	end)
-end
-
-function buildUI()
-	if UI.building then
-		return
-	end
-	UI.building = true
-	destroyUI()
-
-	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
-
-	local gui = Instance.new("ScreenGui")
-	gui.Name = "HumanlikeAutoMansGui"
-	gui.ResetOnSpawn = false
-	gui.IgnoreGuiInset = true
-	gui.DisplayOrder = 1000
-	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-	gui.Enabled = true
-
-	local button = Instance.new("TextButton")
-	button.Name = "ToggleButton"
-	button.AnchorPoint = Vector2.new(0.5, 0.5)
-	button.Size = UDim2.fromOffset(64, 64)
-	button.Position = UI.savedPos
-	button.AutoButtonColor = false
-	button.Text = ""
-	button.Active = true
-	button.BorderSizePixel = 0
-	button.BackgroundColor3 = COLOR_OFF_BG
-	button.Parent = gui
-
-	local corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(1, 0)
-	corner.Parent = button
-
-	local stroke = Instance.new("UIStroke")
-	stroke.Thickness = 2.5
-	stroke.Color = COLOR_OFF
-	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-	stroke.Parent = button
-
-	local gradient = Instance.new("UIGradient")
-	gradient.Rotation = 90
-	gradient.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(165, 165, 180))
-	gradient.Parent = button
-
-	local scale = Instance.new("UIScale")
-	scale.Scale = 1
-	scale.Parent = button
-
-	local dot = Instance.new("Frame")
-	dot.Name = "Dot"
-	dot.AnchorPoint = Vector2.new(0.5, 0)
-	dot.Position = UDim2.new(0.5, 0, 0, 7)
-	dot.Size = UDim2.fromOffset(8, 8)
-	dot.BorderSizePixel = 0
-	dot.BackgroundColor3 = COLOR_OFF
-	dot.Parent = button
-	local dotCorner = Instance.new("UICorner")
-	dotCorner.CornerRadius = UDim.new(1, 0)
-	dotCorner.Parent = dot
-
-	local title = Instance.new("TextLabel")
-	title.Name = "Title"
-	title.BackgroundTransparency = 1
-	title.Position = UDim2.new(0, 0, 0, 17)
-	title.Size = UDim2.new(1, 0, 0, 18)
-	title.Font = Enum.Font.GothamBlack
-	title.TextSize = 15
-	title.TextColor3 = Color3.fromRGB(240, 240, 248)
-	title.Text = "AUTO"
-	title.Parent = button
-
-	local status = Instance.new("TextLabel")
-	status.Name = "Status"
-	status.BackgroundTransparency = 1
-	status.Position = UDim2.new(0, 0, 0, 35)
-	status.Size = UDim2.new(1, 0, 0, 18)
-	status.Font = Enum.Font.GothamBold
-	status.TextSize = 14
-	status.TextColor3 = COLOR_OFF
-	status.Text = "OFF"
-	status.Parent = button
-
-	UI.gui, UI.button, UI.title, UI.status, UI.stroke, UI.dot, UI.scale = gui, button, title, status, stroke, dot, scale
-
-	local function track(conn)
-		UI.conns[#UI.conns + 1] = conn
-		return conn
-	end
-
-	track(gui.AncestryChanged:Connect(queueValidate))
-	track(button.AncestryChanged:Connect(queueValidate))
-	track(gui.DescendantRemoving:Connect(queueValidate))
-	track(gui:GetPropertyChangedSignal("Enabled"):Connect(queueValidate))
-	track(button:GetPropertyChangedSignal("Visible"):Connect(queueValidate))
-
-	local pressInput, pressStart, startCenter, moved = nil, nil, nil, false
-
-	track(button.InputBegan:Connect(function(input)
-		local t = input.UserInputType
-		if pressInput == nil and (t == Enum.UserInputType.Touch or t == Enum.UserInputType.MouseButton1) then
-			pressInput = input
-			pressStart = input.Position
-			startCenter = button.AbsolutePosition + button.AbsoluteSize * 0.5
-			moved = false
-			TweenService:Create(scale, TWEEN_FAST, { Scale = 0.9 }):Play()
-		end
-	end))
-
-	track(UserInputService.InputChanged:Connect(function(input)
-		if not pressInput then
-			return
-		end
-		local isTouch = pressInput.UserInputType == Enum.UserInputType.Touch
-		if (isTouch and input == pressInput) or (not isTouch and input.UserInputType == Enum.UserInputType.MouseMovement) then
-			local d = input.Position - pressStart
-			if moved or d.Magnitude > 10 then
-				moved = true
-				local vs = gui.AbsoluteSize
-				if vs.X > 0 and vs.Y > 0 then
-					local x = math.clamp(startCenter.X + d.X, 32, math.max(32, vs.X - 32))
-					local y = math.clamp(startCenter.Y + d.Y, 32, math.max(32, vs.Y - 32))
-					button.Position = UDim2.fromScale(x / vs.X, y / vs.Y)
-					UI.savedPos = button.Position
-				end
-			end
-		end
-	end))
-
-	track(UserInputService.InputEnded:Connect(function(input)
-		if not pressInput then
-			return
-		end
-		local isTouch = pressInput.UserInputType == Enum.UserInputType.Touch
-		local matches = (isTouch and input == pressInput) or (not isTouch and input.UserInputType == Enum.UserInputType.MouseButton1)
-		if matches then
-			local wasMoved = moved
-			pressInput = nil
-			TweenService:Create(scale, TWEEN_FAST, { Scale = 1 }):Play()
-			if not wasMoved then
-				setEnabled(not Enabled)
-			end
-		end
-	end))
-
-	gui.Parent = playerGui
-	refreshUI(false)
-	UI.building = false
-end
-
--- =====================================================================
--- ЗАПУСК
--- =====================================================================
-LocalPlayer:SetAttribute("AutoEvasionEnabled", Enabled)
-LocalPlayer:SetAttribute("AutoEvasionState", fsm)
-
--- внешнее управление: LocalPlayer:SetAttribute("AutoEvasionEnabled", true/false)
-LocalPlayer:GetAttributeChangedSignal("AutoEvasionEnabled"):Connect(function()
-	local a = LocalPlayer:GetAttribute("AutoEvasionEnabled")
-	if type(a) == "boolean" and a ~= Enabled then
-		setEnabled(a)
-	end
+local activeThreatsCache = {}
+local candidateModels = {}
+local selectedDirection = Vector3.zero
+local plannedDirection = Vector3.zero
+local commandDirection = Vector3.zero
+local commandVelocity = Vector3.zero
+local lastKnownGroundY = nil
+local lastScan = 0
+local lastThink = 0
+local lastStatus = "Ожидание"
+local lastGuiText = ""
+local stuckStatusUntil = 0
+local lastProgressCheck = 0
+local progressPosition
+local stuckDirection = Vector3.zero
+local stuckUntil = 0
+local weaveSign = 1
+local nextWeaveFlip = 0
+local weavePhase = Random.new():NextNumber(0, math.pi * 2)
+local randomGenerator = Random.new()
+-- Pro-movement state (v0.9)
+local jukeRandom = Random.new()
+local nextJukeAt = 0
+local jukeActiveUntil = 0
+local jukeCounterAt = 0
+local jukeCountered = false
+local jukePendingSide = 1
+local jukeIsReverse = false
+local strafeSide = 1
+local nextStrafeFlip = 0
+local serpentineFrequency = 2.4
+local nextSerpentineFrequencyChange = 0
+local nextJumpDodgeAt = 0
+-- v1.0 state
+local openness = {}
+local opennessTime = -math.huge
+local lastHealthValue
+local panicUntil = 0
+local panicMode = false
+local lastClutchDodge = 0
+local lastClutchCheck = 0
+local clutchActiveUntil = 0
+local clutchDirection = Vector3.zero
+local activePath
+local activePathBlockedConnection
+local pathWaypoints = {}
+local pathIndex = 2
+local pathGoal
+local lastPathJumpIndex = -1
+local pathNeedsReplan = false
+local pathRequestInFlight = false
+local lastPathRequest = -math.huge
+local pathRequestGeneration = 0
+local characterGeneration = 0
+local generalConnections = {}
+local characterConnections = {}
+local shuttingDown = false
+local wasControllingMovement = false
+--==============================================================
+-- UTILITIES
+--==============================================================
+local function disconnectAll(list)
+    for _, connection in ipairs(list) do
+        if connection then
+            connection:Disconnect()
+        end
+    end
+    table.clear(list)
+end
+local function horizontal(vector)
+    return Vector3.new(vector.X, 0, vector.Z)
+end
+local function unitOrZero(vector)
+    vector = horizontal(vector)
+    if vector.Magnitude < 0.001 then
+        return Vector3.zero
+    end
+    return vector.Unit
+end
+local function clampHorizontal(vector, maxMagnitude)
+    vector = horizontal(vector)
+    local magnitude = vector.Magnitude
+    if magnitude > maxMagnitude and magnitude > 0 then
+        return vector.Unit * maxMagnitude
+    end
+    return vector
+end
+local function getCharacterParts(model)
+    if not model or not model:IsA("Model") or model == character then
+        return nil, nil
+    end
+    local otherHumanoid = model:FindFirstChildOfClass("Humanoid")
+    local otherRoot = model:FindFirstChild("HumanoidRootPart")
+    if not otherRoot and otherHumanoid then
+        otherRoot = otherHumanoid.RootPart
+    end
+    if not otherHumanoid or not otherRoot then
+        return nil, nil
+    end
+    if otherHumanoid.Health <= 0 or not otherRoot:IsA("BasePart") then
+        return nil, nil
+    end
+    return otherHumanoid, otherRoot
+end
+local function rebuildRaycastParams()
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = character and { character } or {}
+    params.IgnoreWater = not CONFIG.AVOID_WATER
+    params.RespectCanCollide = true
+    raycastParams = params
+end
+local function setStatus(status)
+    if status and status ~= lastStatus then
+        lastStatus = status
+        lastGuiText = ""
+    end
+end
+local function getHealthRatio()
+    if not humanoid then
+        return 1
+    end
+    return humanoid.Health / math.max(humanoid.MaxHealth, 1)
+end
+local function canCharacterJump()
+    if not humanoid or not humanoid.Parent then
+        return false
+    end
+    if not humanoid:GetStateEnabled(Enum.HumanoidStateType.Jumping) then
+        return false
+    end
+    if humanoid.UseJumpPower then
+        return humanoid.JumpPower > 0
+    end
+    return humanoid.JumpHeight > 0
+end
+local function resetProMovementState()
+    nextJukeAt = 0
+    jukeActiveUntil = 0
+    jukeCounterAt = 0
+    jukeCountered = false
+    jukePendingSide = 1
+    jukeIsReverse = false
+    nextStrafeFlip = 0
+    nextSerpentineFrequencyChange = 0
+    nextJumpDodgeAt = 0
+    commandVelocity = Vector3.zero
+    lastHealthValue = nil
+    panicUntil = 0
+    panicMode = false
+    lastClutchDodge = 0
+    lastClutchCheck = 0
+    clutchActiveUntil = 0
+    clutchDirection = Vector3.zero
+    table.clear(openness)
+    opennessTime = -math.huge
+end
+--==============================================================
+-- SELF-REPAIRING DRAGGABLE GUI
+--==============================================================
+local UI_GUI_NAME = "SurvivalAI_Pirozhok"
+local UI_BUTTON_SIZE = 64
+local UI_EDGE_SIZE = 12
+local UI_DRAG_THRESHOLD = 5
+local UI_SCREEN_MARGIN = 5
+local UI_REPAIR_INTERVAL = 0.45
+local screenGui
+local canvas
+local buttonRoot
+local toggleButton
+local dragHandles = {}
+local buttonPosition
+local dragState
+local activeTouches = {}
+local guiConnections = {}
+local rebuildingGui = false
+local setEnabled
+local updateGui
+local ensureGui
+local oldGui = PlayerGui:FindFirstChild(UI_GUI_NAME)
+if oldGui then
+    oldGui:Destroy()
+end
+local function clampButtonPosition(position)
+    if not canvas or canvas.AbsoluteSize.X <= 0 or canvas.AbsoluteSize.Y <= 0 then
+        return position
+    end
+    local half = UI_BUTTON_SIZE * 0.5
+    local usable = canvas.AbsoluteSize
+    local minX = math.min(half + UI_SCREEN_MARGIN, usable.X * 0.5)
+    local minY = math.min(half + UI_SCREEN_MARGIN, usable.Y * 0.5)
+    local maxX = math.max(minX, usable.X - half - UI_SCREEN_MARGIN)
+    local maxY = math.max(minY, usable.Y - half - UI_SCREEN_MARGIN)
+    return Vector2.new(
+        math.clamp(position.X, minX, maxX),
+        math.clamp(position.Y, minY, maxY)
+    )
+end
+local function applyButtonPosition(position)
+    if not canvas or not buttonRoot then
+        buttonPosition = position
+        return
+    end
+    position = clampButtonPosition(position)
+    buttonPosition = position
+    buttonRoot.Position = UDim2.fromOffset(position.X, position.Y)
+end
+local function initializeOrClampPosition()
+    if not canvas or canvas.AbsoluteSize.X <= 0 or canvas.AbsoluteSize.Y <= 0 then
+        return
+    end
+    if not buttonPosition then
+        buttonPosition = Vector2.new(
+            canvas.AbsoluteSize.X - (UI_BUTTON_SIZE * 0.5 + 14),
+            canvas.AbsoluteSize.Y * 0.46
+        )
+    end
+    applyButtonPosition(buttonPosition)
+end
+updateGui = function()
+    if not toggleButton or not toggleButton.Parent then
+        return
+    end
+    toggleButton.Text = enabled and "AI\nON" or "AI\nOFF"
+    toggleButton.BackgroundColor3 = enabled
+        and Color3.fromRGB(42, 112, 75)
+        or Color3.fromRGB(39, 43, 51)
+    toggleButton.TextColor3 = Color3.fromRGB(248, 248, 250)
+    local stateText = enabled
+        and (lastStatus .. " | угроз: " .. tostring(#activeThreatsCache))
+        or "Выключен — обычное управление"
+    toggleButton:SetAttribute("SurvivalAIStatus", stateText)
+end
+local function finishDrag(pointer)
+    if not dragState then
+        return
+    end
+    if pointer and dragState.input ~= pointer then
+        return
+    end
+    dragState = nil
+end
+local function beginEdgeDrag(input)
+    if dragState then
+        return
+    end
+    local inputType = input.UserInputType
+    if inputType ~= Enum.UserInputType.Touch
+        and inputType ~= Enum.UserInputType.MouseButton1 then
+        return
+    end
+    if inputType == Enum.UserInputType.Touch then
+        for touch in pairs(activeTouches) do
+            if touch ~= input then
+                return
+            end
+        end
+    end
+    if not buttonPosition and buttonRoot then
+        buttonPosition = Vector2.new(
+            buttonRoot.Position.X.Offset,
+            buttonRoot.Position.Y.Offset
+        )
+    end
+    dragState = {
+        input = input,
+        inputType = inputType,
+        pointerStart = Vector2.new(input.Position.X, input.Position.Y),
+        positionStart = buttonPosition or Vector2.new(100, 100),
+        moved = false,
+    }
+end
+local function updateDragPosition(pointerPosition)
+    local state = dragState
+    if not state then
+        return
+    end
+    local delta = pointerPosition - state.pointerStart
+    if not state.moved then
+        if delta.Magnitude < UI_DRAG_THRESHOLD then
+            return
+        end
+        state.moved = true
+    end
+    applyButtonPosition(state.positionStart + delta)
+end
+local function buildGui()
+    screenGui = Instance.new("ScreenGui")
+    screenGui.Name = UI_GUI_NAME
+    screenGui.ResetOnSpawn = false
+    screenGui.IgnoreGuiInset = false
+    screenGui.Enabled = true
+    screenGui.DisplayOrder = 50
+    screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    screenGui.Parent = PlayerGui
+    canvas = Instance.new("Frame")
+    canvas.Name = "Canvas"
+    canvas.BackgroundTransparency = 1
+    canvas.BorderSizePixel = 0
+    canvas.Size = UDim2.fromScale(1, 1)
+    canvas.Position = UDim2.fromScale(0, 0)
+    canvas.Visible = true
+    canvas.Parent = screenGui
+    buttonRoot = Instance.new("Frame")
+    buttonRoot.Name = "DraggableToggle"
+    buttonRoot.AnchorPoint = Vector2.new(0.5, 0.5)
+    buttonRoot.Size = UDim2.fromOffset(UI_BUTTON_SIZE, UI_BUTTON_SIZE)
+    buttonRoot.BackgroundColor3 = Color3.fromRGB(21, 24, 30)
+    buttonRoot.BackgroundTransparency = 0.04
+    buttonRoot.BorderSizePixel = 0
+    buttonRoot.ClipsDescendants = true
+    buttonRoot.Visible = true
+    buttonRoot.ZIndex = 1
+    buttonRoot.Parent = canvas
+    local rootCorner = Instance.new("UICorner")
+    rootCorner.CornerRadius = UDim.new(0, 15)
+    rootCorner.Parent = buttonRoot
+    local rootStroke = Instance.new("UIStroke")
+    rootStroke.Color = Color3.fromRGB(108, 116, 131)
+    rootStroke.Thickness = 1.25
+    rootStroke.Transparency = 0.12
+    rootStroke.Parent = buttonRoot
+    local edgeSpecs = {
+        {
+            Name = "DragTop",
+            Position = UDim2.fromOffset(0, 0),
+            Size = UDim2.new(1, 0, 0, UI_EDGE_SIZE),
+        },
+        {
+            Name = "DragBottom",
+            Position = UDim2.new(0, 0, 1, -UI_EDGE_SIZE),
+            Size = UDim2.new(1, 0, 0, UI_EDGE_SIZE),
+        },
+        {
+            Name = "DragLeft",
+            Position = UDim2.fromOffset(0, UI_EDGE_SIZE),
+            Size = UDim2.new(0, UI_EDGE_SIZE, 1, -UI_EDGE_SIZE * 2),
+        },
+        {
+            Name = "DragRight",
+            Position = UDim2.new(1, -UI_EDGE_SIZE, 0, UI_EDGE_SIZE),
+            Size = UDim2.new(0, UI_EDGE_SIZE, 1, -UI_EDGE_SIZE * 2),
+        },
+    }
+    table.clear(dragHandles)
+    for _, spec in ipairs(edgeSpecs) do
+        local edge = Instance.new("TextButton")
+        edge.Name = spec.Name
+        edge.Position = spec.Position
+        edge.Size = spec.Size
+        edge.BackgroundTransparency = 1
+        edge.BorderSizePixel = 0
+        edge.Text = ""
+        edge.AutoButtonColor = false
+        edge.Active = true
+        edge.Interactable = true
+        edge.Selectable = false
+        edge.ZIndex = 2
+        edge.Parent = buttonRoot
+        table.insert(dragHandles, edge)
+        table.insert(guiConnections, edge.InputBegan:Connect(beginEdgeDrag))
+    end
+    toggleButton = Instance.new("TextButton")
+    toggleButton.Name = "CenterToggle"
+    toggleButton.AnchorPoint = Vector2.new(0.5, 0.5)
+    toggleButton.Position = UDim2.fromScale(0.5, 0.5)
+    toggleButton.Size = UDim2.fromOffset(
+        UI_BUTTON_SIZE - UI_EDGE_SIZE * 2,
+        UI_BUTTON_SIZE - UI_EDGE_SIZE * 2
+    )
+    toggleButton.BackgroundColor3 = Color3.fromRGB(39, 43, 51)
+    toggleButton.BackgroundTransparency = 0
+    toggleButton.BorderSizePixel = 0
+    toggleButton.Text = "AI\nOFF"
+    toggleButton.TextColor3 = Color3.fromRGB(248, 248, 250)
+    toggleButton.TextSize = 12
+    toggleButton.TextWrapped = true
+    toggleButton.Font = Enum.Font.GothamBold
+    toggleButton.AutoButtonColor = true
+    toggleButton.Active = true
+    toggleButton.Interactable = true
+    toggleButton.Selectable = false
+    toggleButton.ZIndex = 3
+    toggleButton.Visible = true
+    toggleButton.Parent = buttonRoot
+    local centerCorner = Instance.new("UICorner")
+    centerCorner.CornerRadius = UDim.new(0, 10)
+    centerCorner.Parent = toggleButton
+    table.insert(guiConnections, toggleButton.Activated:Connect(function()
+        if setEnabled and not shuttingDown then
+            setEnabled(not enabled)
+        end
+    end))
+    table.insert(guiConnections, canvas:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+        initializeOrClampPosition()
+    end))
+    table.insert(guiConnections, screenGui.DescendantRemoving:Connect(function(instance)
+        if rebuildingGui or shuttingDown then
+            return
+        end
+        if instance == canvas or instance == buttonRoot or instance == toggleButton then
+            task.defer(function()
+                if not rebuildingGui and not shuttingDown and ensureGui then
+                    ensureGui()
+                end
+            end)
+            return
+        end
+        for _, edge in ipairs(dragHandles) do
+            if instance == edge then
+                task.defer(function()
+                    if not rebuildingGui and not shuttingDown and ensureGui then
+                        ensureGui()
+                    end
+                end)
+                break
+            end
+        end
+    end))
+    initializeOrClampPosition()
+    task.defer(initializeOrClampPosition)
+    updateGui()
+end
+local function guiIsHealthy()
+    if not screenGui or screenGui.Name ~= UI_GUI_NAME
+        or screenGui.Parent ~= PlayerGui or not screenGui.Enabled then
+        return false
+    end
+    if not canvas or canvas.Parent ~= screenGui or not canvas.Visible then
+        return false
+    end
+    if not buttonRoot or buttonRoot.Parent ~= canvas or not buttonRoot.Visible
+        or buttonRoot.Size.X.Offset ~= UI_BUTTON_SIZE
+        or buttonRoot.Size.Y.Offset ~= UI_BUTTON_SIZE then
+        return false
+    end
+    if not toggleButton or toggleButton.Parent ~= buttonRoot
+        or not toggleButton.Visible or not toggleButton.Active
+        or not toggleButton.Interactable then
+        return false
+    end
+    if #dragHandles ~= 4 then
+        return false
+    end
+    for _, edge in ipairs(dragHandles) do
+        if not edge or edge.Parent ~= buttonRoot or not edge.Visible
+            or not edge.Active or not edge.Interactable then
+            return false
+        end
+    end
+    return true
+end
+ensureGui = function()
+    if shuttingDown or rebuildingGui
+        or PlayerScripts:GetAttribute(OWNER_ATTRIBUTE) ~= OWNER_TOKEN then
+        return
+    end
+    if guiIsHealthy() then
+        initializeOrClampPosition()
+        updateGui()
+        return
+    end
+    rebuildingGui = true
+    finishDrag()
+    disconnectAll(guiConnections)
+    if screenGui then
+        pcall(function()
+            screenGui:Destroy()
+        end)
+    end
+    screenGui = nil
+    canvas = nil
+    buttonRoot = nil
+    toggleButton = nil
+    table.clear(dragHandles)
+    local ok, err = pcall(buildGui)
+    if not ok then
+        rebuildingGui = true
+        disconnectAll(guiConnections)
+        if screenGui then
+            pcall(function()
+                screenGui:Destroy()
+            end)
+        end
+        screenGui = nil
+        canvas = nil
+        buttonRoot = nil
+        toggleButton = nil
+        table.clear(dragHandles)
+        rebuildingGui = false
+        if CONFIG.DEBUG then
+            warn("[SurvivalAI] GUI creation failed:", err)
+        end
+        return
+    end
+    rebuildingGui = false
+    updateGui()
+end
+table.insert(generalConnections, UserInputService.TouchStarted:Connect(function(touch)
+    activeTouches[touch] = true
+    if dragState
+        and dragState.inputType == Enum.UserInputType.Touch
+        and dragState.input ~= touch then
+        finishDrag()
+    end
+end))
+table.insert(generalConnections, UserInputService.TouchEnded:Connect(function(touch)
+    activeTouches[touch] = nil
+    finishDrag(touch)
+end))
+table.insert(generalConnections, UserInputService.TouchMoved:Connect(function(touch)
+    local state = dragState
+    if not state
+        or state.inputType ~= Enum.UserInputType.Touch
+        or state.input ~= touch then
+        return
+    end
+    updateDragPosition(Vector2.new(touch.Position.X, touch.Position.Y))
+end))
+table.insert(generalConnections, UserInputService.InputChanged:Connect(function(input)
+    local state = dragState
+    if not state or state.inputType ~= Enum.UserInputType.MouseButton1 then
+        return
+    end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement then
+        return
+    end
+    updateDragPosition(Vector2.new(input.Position.X, input.Position.Y))
+end))
+table.insert(generalConnections, UserInputService.InputEnded:Connect(function(input)
+    if dragState and dragState.inputType == Enum.UserInputType.MouseButton1
+        and input.UserInputType == Enum.UserInputType.MouseButton1 then
+        finishDrag(dragState.input)
+    end
+end))
+table.insert(generalConnections, UserInputService.WindowFocusReleased:Connect(function()
+    finishDrag()
+    table.clear(activeTouches)
+end))
+table.insert(generalConnections, PlayerGui.ChildRemoved:Connect(function(child)
+    if child.Name == UI_GUI_NAME then
+        task.defer(function()
+            if not shuttingDown and ensureGui then
+                ensureGui()
+            end
+        end)
+    end
+end))
+ensureGui()
+task.spawn(function()
+    while not shuttingDown
+        and PlayerScripts:GetAttribute(OWNER_ATTRIBUTE) == OWNER_TOKEN do
+        task.wait(UI_REPAIR_INTERVAL)
+        if not shuttingDown
+            and PlayerScripts:GetAttribute(OWNER_ATTRIBUTE) == OWNER_TOKEN then
+            local ok, err = pcall(ensureGui)
+            if not ok and CONFIG.DEBUG then
+                warn("[SurvivalAI] GUI recovery error:", err)
+            end
+        end
+    end
 end)
-
--- момент создания деталей: отличает только что появившиеся лучи/зоны от старой геометрии карты
-Workspace.DescendantAdded:Connect(function(inst)
-	if inst:IsA("BasePart") then
-		bornAt[inst] = os.clock()
-	end
-end)
-
-buildUI()
-local playerGuiRoot = LocalPlayer:WaitForChild("PlayerGui")
-playerGuiRoot.ChildRemoved:Connect(function(child)
-	if child == UI.gui or child.Name == "HumanlikeAutoMansGui" then
-		queueValidate()
-	end
-end)
-
-if Config.NpcModel then
-	task.spawn(onCharacter, Config.NpcModel)
-else
-	LocalPlayer.CharacterAdded:Connect(onCharacter)
-	if LocalPlayer.Character then
-		task.spawn(onCharacter, LocalPlayer.Character)
-	else
-		cachedReason = "NoCharacter"
-	end
+--==============================================================
+-- NO-TAG MODEL REGISTRY
+--==============================================================
+local function refreshCandidateModel(model)
+    if not model or not model:IsA("Model") then
+        return
+    end
+    if not model:IsDescendantOf(Workspace) then
+        candidateModels[model] = nil
+        return
+    end
+    local h = model:FindFirstChildOfClass("Humanoid")
+    local r = model:FindFirstChild("HumanoidRootPart")
+    if not r and h then
+        r = h.RootPart
+    end
+    if h and r and r:IsA("BasePart") then
+        candidateModels[model] = true
+    else
+        candidateModels[model] = nil
+    end
 end
-
--- плавный вектор движения применяется ПОСЛЕ ввода игрока (приоритет Input + 2), иначе ControlModule перезапишет Move
-RunService:BindToRenderStep("HumanlikeAutoMansMove", Enum.RenderPriority.Input.Value + 2, applyMove)
-RunService.Heartbeat:Connect(onHeartbeat)
+local function refreshModelAncestors(instance)
+    local current = instance
+    while current and current ~= Workspace do
+        if current:IsA("Model") then
+            refreshCandidateModel(current)
+        end
+        current = current.Parent
+    end
+end
+local pendingTreeRefresh = {}
+local function scheduleModelTreeRefresh(model)
+    if pendingTreeRefresh[model] then
+        return
+    end
+    local ancestor = model.Parent
+    while ancestor and ancestor ~= Workspace do
+        if ancestor:IsA("Model") and pendingTreeRefresh[ancestor] then
+            return
+        end
+        ancestor = ancestor.Parent
+    end
+    pendingTreeRefresh[model] = true
+    task.defer(function()
+        if shuttingDown then
+            pendingTreeRefresh[model] = nil
+            return
+        end
+        pendingTreeRefresh[model] = nil
+        if not model:IsDescendantOf(Workspace) then
+            return
+        end
+        local stack = { model }
+        local processed = 0
+        while #stack > 0 and not shuttingDown do
+            local current = table.remove(stack)
+            if current and current.Parent then
+                if current:IsA("Model") then
+                    refreshCandidateModel(current)
+                end
+                for _, child in ipairs(current:GetChildren()) do
+                    stack[#stack + 1] = child
+                end
+            end
+            processed = processed + 1
+            if processed >= 300 then
+                processed = 0
+                task.wait()
+            end
+        end
+    end)
+end
+table.insert(generalConnections, Workspace.DescendantAdded:Connect(function(instance)
+    if shuttingDown then
+        return
+    end
+    if instance:IsA("Model") then
+        refreshModelAncestors(instance)
+        refreshCandidateModel(instance)
+        scheduleModelTreeRefresh(instance)
+    elseif instance:IsA("Humanoid") or instance:IsA("BasePart") then
+        refreshModelAncestors(instance)
+    end
+end))
+table.insert(generalConnections, Workspace.DescendantRemoving:Connect(function(instance)
+    if shuttingDown then
+        return
+    end
+    local isRelevant = instance:IsA("Model")
+        or instance:IsA("Humanoid")
+        or instance:IsA("BasePart")
+    if not isRelevant then
+        return
+    end
+    local oldParent = instance.Parent
+    if instance:IsA("Model") then
+        candidateModels[instance] = nil
+    end
+    task.defer(function()
+        if not shuttingDown and oldParent then
+            refreshModelAncestors(oldParent)
+        end
+    end)
+end))
+task.spawn(function()
+    local stack = { Workspace }
+    local visited = 0
+    while #stack > 0 and not shuttingDown do
+        local instance = table.remove(stack)
+        if instance and (instance == Workspace or instance.Parent ~= nil) then
+            if instance:IsA("Model") then
+                refreshCandidateModel(instance)
+            end
+            local children = instance:GetChildren()
+            for _, child in ipairs(children) do
+                stack[#stack + 1] = child
+                visited = visited + 1
+            end
+        end
+        if visited >= 350 then
+            visited = 0
+            task.wait()
+        end
+    end
+end)
+--==============================================================
+-- THREAT SENSING
+--==============================================================
+local function insertTrackedThreat(threat)
+    local insertAt = #threats + 1
+    for index, existing in ipairs(threats) do
+        if threat.Weight > existing.Weight then
+            insertAt = index
+            break
+        end
+    end
+    if insertAt > CONFIG.MAX_TRACKED_THREATS then
+        return
+    end
+    table.insert(threats, insertAt, threat)
+    if #threats > CONFIG.MAX_TRACKED_THREATS then
+        table.remove(threats)
+    end
+end
+local function hasLineOfSight(model, otherRoot, params)
+    if not rootPart or not otherRoot or not otherRoot.Parent then
+        return false
+    end
+    local origin = rootPart.Position + Vector3.new(0, 1.2, 0)
+    local target = otherRoot.Position + Vector3.new(0, 1.2, 0)
+    local result = Workspace:Raycast(origin, target - origin, params)
+    if not result then
+        return true
+    end
+    return result.Instance:IsDescendantOf(model)
+end
+local function scanThreats()
+    table.clear(threats)
+    if not rootPart or not rootPart.Parent then
+        return
+    end
+    if not raycastParams then
+        rebuildRaycastParams()
+    end
+    local params = raycastParams
+    local seen = {}
+    local myPosition = rootPart.Position
+    local myVelocity = clampHorizontal(rootPart.AssemblyLinearVelocity, 40)
+    local function considerModel(model)
+        if seen[model] then
+            return
+        end
+        seen[model] = true
+        local _, otherRoot = getCharacterParts(model)
+        if not otherRoot or not otherRoot.Parent then
+            candidateModels[model] = nil
+            return
+        end
+        local offset = horizontal(otherRoot.Position - myPosition)
+        local distance = offset.Magnitude
+        if distance < 0.1 or distance > CONFIG.DETECTION_RADIUS then
+            return
+        end
+        local directionToTarget = offset.Unit
+        local targetVelocity = clampHorizontal(otherRoot.AssemblyLinearVelocity, 32)
+        local relativeVelocity = targetVelocity - myVelocity
+        local closingSpeed = relativeVelocity:Dot(-directionToTarget)
+        local visible = false
+        if distance > CONFIG.FLEE_RADIUS
+            and closingSpeed >= CONFIG.FAST_APPROACH_SPEED then
+            visible = hasLineOfSight(model, otherRoot, params)
+        end
+        local proximity = 1 - math.clamp(distance / CONFIG.DETECTION_RADIUS, 0, 1)
+        local closingFactor = math.clamp(closingSpeed / 18, 0, 1)
+        local weight = 0.25 + proximity * 1.55 + closingFactor * 0.8
+        if distance > CONFIG.FLEE_RADIUS and not visible then
+            weight = weight * 0.55
+        end
+        insertTrackedThreat({
+            Model = model,
+            Root = otherRoot,
+            Distance = distance,
+            Direction = directionToTarget,
+            Velocity = targetVelocity,
+            ClosingSpeed = closingSpeed,
+            Visible = visible,
+            Weight = weight,
+        })
+    end
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            considerModel(player.Character)
+        end
+    end
+    for model in pairs(candidateModels) do
+        if model:IsDescendantOf(Workspace) then
+            considerModel(model)
+        else
+            candidateModels[model] = nil
+        end
+    end
+end
+local function refreshThreatKinematics()
+    if not rootPart or not rootPart.Parent then
+        table.clear(threats)
+        return
+    end
+    local myPosition = rootPart.Position
+    local myVelocity = clampHorizontal(rootPart.AssemblyLinearVelocity, 40)
+    for index = #threats, 1, -1 do
+        local threat = threats[index]
+        local targetHumanoid, targetRoot = getCharacterParts(threat.Model)
+        if not targetHumanoid or not targetRoot or not targetRoot.Parent then
+            table.remove(threats, index)
+        else
+            threat.Root = targetRoot
+            local offset = horizontal(targetRoot.Position - myPosition)
+            local distance = offset.Magnitude
+            if distance > CONFIG.DETECTION_RADIUS * 1.15 or distance < 0.05 then
+                table.remove(threats, index)
+            else
+                local direction = offset.Unit
+                local targetVelocity = clampHorizontal(targetRoot.AssemblyLinearVelocity, 32)
+                local closingSpeed = (targetVelocity - myVelocity):Dot(-direction)
+                local proximity = 1 - math.clamp(distance / CONFIG.DETECTION_RADIUS, 0, 1)
+                local closingFactor = math.clamp(closingSpeed / 18, 0, 1)
+                local weight = 0.25 + proximity * 1.55 + closingFactor * 0.8
+                if distance > CONFIG.FLEE_RADIUS and not threat.Visible then
+                    weight = weight * 0.55
+                end
+                threat.Distance = distance
+                threat.Direction = direction
+                threat.Velocity = targetVelocity
+                threat.ClosingSpeed = closingSpeed
+                threat.Weight = weight
+            end
+        end
+    end
+    table.sort(threats, function(a, b)
+        return a.Weight > b.Weight
+    end)
+    while #threats > CONFIG.MAX_TRACKED_THREATS do
+        table.remove(threats)
+    end
+end
+local function getActiveThreats()
+    refreshThreatKinematics()
+    local active = {}
+    for _, threat in ipairs(threats) do
+        if threat.Root and threat.Root.Parent then
+            local closeEnough = threat.Distance <= CONFIG.FLEE_RADIUS
+            local approachingFast = threat.Visible
+                and threat.ClosingSpeed >= CONFIG.FAST_APPROACH_SPEED
+            if closeEnough or approachingFast then
+                table.insert(active, threat)
+                if #active >= CONFIG.MAX_THREATS_TO_CONSIDER then
+                    break
+                end
+            end
+        end
+    end
+    return active
+end
+local function isEmergency(activeThreats)
+    for _, threat in ipairs(activeThreats) do
+        if threat.Distance <= CONFIG.EMERGENCY_DISTANCE then
+            return true
+        end
+        if threat.Distance <= CONFIG.EMERGENCY_CLOSING_DISTANCE
+            and threat.ClosingSpeed >= CONFIG.EMERGENCY_CLOSING_SPEED then
+            return true
+        end
+        if threat.ClosingSpeed > 0
+            and threat.Distance <= CONFIG.EMERGENCY_TTC_MAX_DISTANCE
+            and threat.Distance / threat.ClosingSpeed <= CONFIG.EMERGENCY_TIME_TO_CONTACT then
+            return true
+        end
+    end
+    return false
+end
+--==============================================================
+-- LOCAL SAFETY PROBES
+--==============================================================
+local function clearanceScore(position, direction, params, includeSideProbes)
+    local probeLength = CONFIG.PROBE_DISTANCE
+    local offsets = { Vector3.zero }
+    if includeSideProbes then
+        local side = Vector3.new(-direction.Z, 0, direction.X)
+        offsets[2] = side * CONFIG.SIDE_PROBE_OFFSET
+        offsets[3] = -side * CONFIG.SIDE_PROBE_OFFSET
+    end
+    local minimumClearance = 1
+    for _, offset in ipairs(offsets) do
+        local origin = position + offset + Vector3.new(0, 1.3, 0)
+        local result = Workspace:Raycast(origin, direction * probeLength, params)
+        if result then
+            local distance = (result.Position - origin).Magnitude
+            minimumClearance = math.min(
+                minimumClearance,
+                math.clamp(distance / probeLength, 0, 1)
+            )
+        end
+    end
+    return minimumClearance
+end
+local function getCurrentGroundY(position, params)
+    local result = Workspace:Raycast(
+        position + Vector3.new(0, 2, 0),
+        Vector3.new(0, -16, 0),
+        params
+    )
+    local grounded = humanoid
+        and humanoid.Parent
+        and humanoid.FloorMaterial ~= Enum.Material.Air
+    if result and result.Normal.Y >= 0.5
+        and (not CONFIG.AVOID_WATER or result.Material ~= Enum.Material.Water) then
+        if grounded or lastKnownGroundY == nil then
+            lastKnownGroundY = result.Position.Y
+        end
+    elseif not grounded then
+        return lastKnownGroundY
+    end
+    return lastKnownGroundY
+end
+local function hasSafeGround(position, direction, params, currentGroundY)
+    if currentGroundY == nil then
+        return true
+    end
+    local destination = position + direction * CONFIG.LOOK_AHEAD_DISTANCE
+    local groundResult = Workspace:Raycast(
+        destination + Vector3.new(0, 5, 0),
+        Vector3.new(0, -22, 0),
+        params
+    )
+    if not groundResult or groundResult.Normal.Y < 0.5 then
+        return false
+    end
+    if CONFIG.AVOID_WATER and groundResult.Material == Enum.Material.Water then
+        return false
+    end
+    local heightDifference = groundResult.Position.Y - currentGroundY
+    return heightDifference >= -CONFIG.MAX_SAFE_DROP
+        and heightDifference <= CONFIG.MAX_STEP_UP
+end
+--==============================================================
+-- OPEN SPACE MAP (v1.0)
+-- A cheap cached ring of clearance samples used to bias escapes
+-- toward open areas and to pick clutch-dodge sides intelligently.
+--==============================================================
+local function updateOpennessMap(now)
+    if not CONFIG.OPENNESS_ENABLED then
+        return
+    end
+    if now - opennessTime < CONFIG.OPENNESS_REFRESH_INTERVAL then
+        return
+    end
+    if not rootPart or not rootPart.Parent then
+        return
+    end
+    if not raycastParams then
+        rebuildRaycastParams()
+    end
+    opennessTime = now
+    local position = rootPart.Position
+    local origin = position + Vector3.new(0, 1.3, 0)
+    local count = CONFIG.OPENNESS_RAYS
+    for index = 1, count do
+        local angle = (index - 1) * (2 * math.pi / count)
+        local direction = Vector3.new(math.cos(angle), 0, math.sin(angle))
+        local result = Workspace:Raycast(
+            origin, direction * CONFIG.OPENNESS_PROBE_DISTANCE, raycastParams
+        )
+        local clear = 1
+        if result then
+            clear = math.clamp(
+                (result.Position - origin).Magnitude
+                    / CONFIG.OPENNESS_PROBE_DISTANCE,
+                0, 1
+            )
+        end
+        local entry = openness[index]
+        if entry then
+            entry.Clearance = clear
+        else
+            openness[index] = { Clearance = clear }
+        end
+    end
+    while #openness > count do
+        table.remove(openness)
+    end
+end
+local function sampleOpenness(direction)
+    local count = #openness
+    if count == 0 or direction.Magnitude < 0.001 then
+        return 0.5
+    end
+    local angle = math.atan2(direction.Z, direction.X)
+    if angle < 0 then
+        angle = angle + 2 * math.pi
+    end
+    local indexFloat = angle / (2 * math.pi) * count + 1
+    local firstIndex = math.floor(indexFloat)
+    local fraction = indexFloat - firstIndex
+    firstIndex = ((firstIndex - 1) % count) + 1
+    local secondIndex = (firstIndex % count) + 1
+    local first = openness[firstIndex]
+    local second = openness[secondIndex]
+    if not first or not second then
+        return 0.5
+    end
+    return first.Clearance * (1 - fraction) + second.Clearance * fraction
+end
+local function coneOpenness(direction)
+    direction = unitOrZero(direction)
+    if direction.Magnitude < 0.001 then
+        return 0
+    end
+    local side = Vector3.new(-direction.Z, 0, direction.X)
+    local left = unitOrZero(direction + side * 0.68)
+    local right = unitOrZero(direction - side * 0.68)
+    local center = sampleOpenness(direction)
+    local leftValue = left.Magnitude > 0.001 and sampleOpenness(left) or center
+    local rightValue = right.Magnitude > 0.001 and sampleOpenness(right) or center
+    return center * 0.5 + leftValue * 0.25 + rightValue * 0.25
+end
+--==============================================================
+-- ESCAPE PLANNING + TACTICAL MOTION
+--==============================================================
+local function calculateEscapeBias(activeThreats)
+    local vector = Vector3.zero
+    for _, threat in ipairs(activeThreats) do
+        local weight = threat.Weight / math.max(threat.Distance, 5)
+        vector = vector - threat.Direction * weight
+    end
+    return unitOrZero(vector)
+end
+local function calculateNearestDistance(activeThreats)
+    local nearest = math.huge
+    local closing = 0
+    for _, threat in ipairs(activeThreats) do
+        nearest = math.min(nearest, threat.Distance)
+        closing = math.max(closing, threat.ClosingSpeed)
+    end
+    return nearest, closing
+end
+local function wallSlideFallback(activeThreats, position, params, currentGroundY)
+    -- Last resort when no candidate passes safety checks: detect the
+    -- wall we are being pushed into and slide along its tangent toward
+    -- the side that keeps threats farther away.
+    local away = calculateEscapeBias(activeThreats)
+    if away.Magnitude < 0.001 then
+        local nearestThreat
+        local nearestDistance = math.huge
+        for _, threat in ipairs(activeThreats) do
+            if threat.Distance < nearestDistance then
+                nearestDistance = threat.Distance
+                nearestThreat = threat
+            end
+        end
+        if nearestThreat then
+            away = unitOrZero(-nearestThreat.Direction)
+        end
+    end
+    if away.Magnitude < 0.001 then
+        return nil
+    end
+    local origin = position + Vector3.new(0, 1.3, 0)
+    local result = Workspace:Raycast(origin, away * 8, params)
+    if not result then
+        return nil
+    end
+    local normal = unitOrZero(result.Normal)
+    if normal.Magnitude < 0.001 then
+        return nil
+    end
+    local tangentA = unitOrZero(Vector3.new(-normal.Z, 0, normal.X))
+    local tangentB = -tangentA
+    local function viable(sideDirection)
+        if sideDirection.Magnitude < 0.001 then
+            return false
+        end
+        if not hasSafeGround(position, sideDirection, params, currentGroundY) then
+            return false
+        end
+        return clearanceScore(position, sideDirection, params, false) > 0.25
+    end
+    local aViable = viable(tangentA)
+    local bViable = viable(tangentB)
+    if aViable and bViable then
+        local function sideValue(sideDirection)
+            local value = 0
+            local destination = position + sideDirection * 6
+            for _, threat in ipairs(activeThreats) do
+                if threat.Root and threat.Root.Parent then
+                    value = value + horizontal(
+                        threat.Root.Position - destination
+                    ).Magnitude * threat.Weight
+                end
+            end
+            return value
+        end
+        if sideValue(tangentA) >= sideValue(tangentB) then
+            return tangentA
+        end
+        return tangentB
+    elseif aViable then
+        return tangentA
+    elseif bViable then
+        return tangentB
+    end
+    return nil
+end
+local function scoreDirection(direction, activeThreats, position, params,
+    currentGroundY, escapeBias, styleSide, nearestDistance, now, includeSideProbes)
+    direction = unitOrZero(direction)
+    if direction.Magnitude < 0.001 then
+        return -math.huge
+    end
+    if not hasSafeGround(position, direction, params, currentGroundY) then
+        return -math.huge
+    end
+    local clearance = clearanceScore(position, direction, params, includeSideProbes)
+    local destination = position + direction * CONFIG.LOOK_AHEAD_DISTANCE
+    local weightedGain = 0
+    local weightedDistance = 0
+    local totalWeight = 0
+    local predictionTime = CONFIG.PREDICTION_TIME
+    if humanoid then
+        predictionTime = math.clamp(
+            CONFIG.LOOK_AHEAD_DISTANCE / math.max(humanoid.WalkSpeed, 8),
+            0.25,
+            0.85
+        )
+    end
+    for _, threat in ipairs(activeThreats) do
+        local targetRoot = threat.Root
+        if targetRoot and targetRoot.Parent then
+            local predictedPosition = targetRoot.Position
+                + clampHorizontal(threat.Velocity, 32) * predictionTime
+            local beforeDistance = horizontal(predictedPosition - position).Magnitude
+            local afterDistance = horizontal(predictedPosition - destination).Magnitude
+            local weight = threat.Weight
+            local gain = (afterDistance - beforeDistance)
+                / math.max(CONFIG.LOOK_AHEAD_DISTANCE, 1)
+            gain = math.clamp(gain, -1.5, 1.5)
+            weightedGain = weightedGain + gain * weight
+            weightedDistance = weightedDistance + math.clamp(
+                afterDistance / CONFIG.DETECTION_RADIUS, 0, 1
+            ) * weight
+            totalWeight = totalWeight + weight
+        end
+    end
+    local threatGain = 0
+    local futureDistanceScore = 0
+    if totalWeight > 0 then
+        threatGain = weightedGain / totalWeight
+        futureDistanceScore = weightedDistance / totalWeight
+    end
+    local escapeAlignment = 0
+    if escapeBias.Magnitude > 0.001 then
+        escapeAlignment = direction:Dot(escapeBias)
+    end
+    local inertia = 0
+    if selectedDirection.Magnitude > 0.001 then
+        inertia = direction:Dot(selectedDirection)
+    end
+    -- v1.0: prefer routes that lead into open space (anti-cornering).
+    local openBonus = 0
+    if CONFIG.OPENNESS_ENABLED and #openness > 0 then
+        openBonus = coneOpenness(direction) * CONFIG.OPENNESS_SCORE_WEIGHT
+    end
+    -- v1.0: never run parallel with a faster chaser; cut across them.
+    local antiParallelPenalty = 0
+    if CONFIG.ANTI_PARALLEL_WEIGHT > 0 then
+        for _, threat in ipairs(activeThreats) do
+            local threatVelocity = clampHorizontal(threat.Velocity, 32)
+            if threatVelocity.Magnitude > 5 then
+                local alignment = direction:Dot(threatVelocity.Unit)
+                if alignment > 0 then
+                    local proximity = math.clamp(
+                        1 - threat.Distance / CONFIG.DETECTION_RADIUS, 0, 1
+                    )
+                    antiParallelPenalty = antiParallelPenalty + alignment * proximity
+                end
+            end
+        end
+    end
+    local score = threatGain * 2.5
+        + futureDistanceScore * 0.70
+        + clearance * 1.75
+        + openBonus
+        + escapeAlignment * 0.50
+        + inertia * CONFIG.INERTIA_WEIGHT
+        - antiParallelPenalty * CONFIG.ANTI_PARALLEL_WEIGHT
+    if styleSide.Magnitude > 0.001 and nearestDistance > CONFIG.EMERGENCY_DISTANCE then
+        local styleStrength = math.clamp(
+            (nearestDistance - CONFIG.EMERGENCY_DISTANCE) / 28, 0, 1
+        ) * CONFIG.WEAVE_STRENGTH
+        if getHealthRatio() <= CONFIG.LOW_HEALTH_RATIO then
+            styleStrength = styleStrength * 0.25
+        end
+        score = score + direction:Dot(styleSide) * styleStrength * weaveSign
+    end
+    if getHealthRatio() <= CONFIG.LOW_HEALTH_RATIO then
+        score = score + escapeAlignment * 0.85
+    end
+    if now < stuckUntil and stuckDirection.Magnitude > 0.001 then
+        score = score - math.max(direction:Dot(stuckDirection), 0) * 1.4
+    end
+    if clearance < 0.18 then
+        score = score - 1.9
+    elseif clearance < 0.35 then
+        score = score - 0.7
+    end
+    return score
+end
+local function chooseEscapeDirection(activeThreats)
+    if not rootPart or not humanoid or #activeThreats == 0 then
+        return Vector3.zero, "Рядом спокойно", false
+    end
+    if not raycastParams then
+        rebuildRaycastParams()
+    end
+    local position = rootPart.Position
+    local params = raycastParams
+    local currentGroundY = getCurrentGroundY(position, params)
+    local now = os.clock()
+    updateOpennessMap(now)
+    local escapeBias = calculateEscapeBias(activeThreats)
+    local nearestDistance, maxClosing = calculateNearestDistance(activeThreats)
+    local styleSide = Vector3.zero
+    if escapeBias.Magnitude > 0.001 then
+        styleSide = Vector3.new(-escapeBias.Z, 0, escapeBias.X)
+    end
+    local candidates = {}
+    local function addCandidate(direction)
+        direction = unitOrZero(direction)
+        if direction.Magnitude < 0.001 then
+            return
+        end
+        for _, candidate in ipairs(candidates) do
+            if candidate:Dot(direction) > 0.985 then
+                return
+            end
+        end
+        table.insert(candidates, direction)
+    end
+    for index = 1, CONFIG.DIRECTION_COUNT do
+        local angle = (index - 1) * (2 * math.pi / CONFIG.DIRECTION_COUNT)
+        addCandidate(Vector3.new(math.cos(angle), 0, math.sin(angle)))
+    end
+    if escapeBias.Magnitude > 0.001 then
+        addCandidate(escapeBias)
+        addCandidate((escapeBias + styleSide * 0.45).Unit)
+        addCandidate((escapeBias - styleSide * 0.45).Unit)
+    end
+    if nearestDistance <= 22 or maxClosing >= CONFIG.EMERGENCY_CLOSING_SPEED then
+        for index = 1, math.min(2, #activeThreats) do
+            local threat = activeThreats[index]
+            local away = -threat.Direction
+            local side = Vector3.new(-away.Z, 0, away.X)
+            addCandidate((away * 0.55 + side * CONFIG.TACTICAL_SIDE_STEP_STRENGTH).Unit)
+            addCandidate((away * 0.55 - side * CONFIG.TACTICAL_SIDE_STEP_STRENGTH).Unit)
+            addCandidate((away * 0.82 + side * 0.42).Unit)
+            addCandidate((away * 0.82 - side * 0.42).Unit)
+        end
+    end
+    local preliminary = {}
+    for _, direction in ipairs(candidates) do
+        local score = scoreDirection(
+            direction, activeThreats, position, params, currentGroundY,
+            escapeBias, styleSide, nearestDistance, now, false
+        )
+        if score > -math.huge then
+            table.insert(preliminary, { Direction = direction, Score = score })
+        end
+    end
+    table.sort(preliminary, function(a, b)
+        return a.Score > b.Score
+    end)
+    local bestDirection = Vector3.zero
+    local bestScore = -math.huge
+    local finalists = math.min(CONFIG.PRECISE_DIRECTION_COUNT, #preliminary)
+    for index = 1, finalists do
+        local candidate = preliminary[index].Direction
+        local score = scoreDirection(
+            candidate, activeThreats, position, params, currentGroundY,
+            escapeBias, styleSide, nearestDistance, now, true
+        )
+        if score > bestScore then
+            bestScore = score
+            bestDirection = candidate
+        end
+    end
+    if bestScore == -math.huge or bestDirection.Magnitude < 0.001 then
+        -- v1.0: slide along the wall instead of standing still.
+        if CONFIG.WALL_SLIDE_ENABLED then
+            local slideDirection = wallSlideFallback(
+                activeThreats, position, params, currentGroundY
+            )
+            if slideDirection then
+                return slideDirection, "Скольжу вдоль стены", true
+            end
+        end
+        return Vector3.zero, "Ищу другой маршрут", true
+    end
+    local finalClearance = clearanceScore(
+        position, bestDirection, params, true
+    )
+    local needsPath = finalClearance < 0.32
+    if finalClearance < 0.07 then
+        local routeCanStart = CONFIG.PATHFINDING_ENABLED
+            and humanoid.FloorMaterial ~= Enum.Material.Air
+            and (pathRequestInFlight
+                or os.clock() - lastPathRequest >= CONFIG.PATH_RETRY_INTERVAL)
+        if routeCanStart then
+            return Vector3.zero, "Препятствие — ищу обход", true
+        end
+    end
+    if getHealthRatio() <= CONFIG.LOW_HEALTH_RATIO then
+        return bestDirection, "Мало HP — отступаю", needsPath
+    elseif isEmergency(activeThreats) then
+        return bestDirection, "Экстренный манёвр", needsPath
+    elseif nearestDistance <= 22 and maxClosing >= CONFIG.FAST_APPROACH_SPEED then
+        return bestDirection, "Уклоняюсь", needsPath
+    end
+    return bestDirection, needsPath and "Проверяю обход" or "Меняю траекторию", needsPath
+end
+--==============================================================
+-- ASYNCHRONOUS PATHFINDING FALLBACK
+--==============================================================
+local function destroyActivePath()
+    if activePathBlockedConnection then
+        activePathBlockedConnection:Disconnect()
+        activePathBlockedConnection = nil
+    end
+    if activePath then
+        pcall(function()
+            activePath:Destroy()
+        end)
+    end
+    activePath = nil
+    pathWaypoints = {}
+    pathIndex = 2
+    pathGoal = nil
+    lastPathJumpIndex = -1
+end
+local function cancelPathfinding()
+    pathRequestGeneration = pathRequestGeneration + 1
+    pathRequestInFlight = false
+    pathNeedsReplan = false
+    destroyActivePath()
+end
+local function addUniqueDirection(list, direction)
+    direction = unitOrZero(direction)
+    if direction.Magnitude < 0.001 then
+        return
+    end
+    for _, existing in ipairs(list) do
+        if existing:Dot(direction) > 0.96 then
+            return
+        end
+    end
+    table.insert(list, direction)
+end
+local function pathFitness(waypoints, candidateDirection, baseDirection, threatSnapshots)
+    if #waypoints < 2 then
+        return -math.huge
+    end
+    local pathLength = 0
+    for index = 2, #waypoints do
+        pathLength = pathLength
+            + (waypoints[index].Position - waypoints[index - 1].Position).Magnitude
+    end
+    local endpoint = waypoints[#waypoints].Position
+    local weightedSeparation = 0
+    local totalWeight = 0
+    for _, snapshot in ipairs(threatSnapshots) do
+        local predicted = snapshot.Position + snapshot.Velocity * 0.75
+        local distance = horizontal(endpoint - predicted).Magnitude
+        weightedSeparation = weightedSeparation
+            + math.min(distance, CONFIG.DETECTION_RADIUS) * snapshot.Weight
+        totalWeight = totalWeight + snapshot.Weight
+    end
+    local separationScore = totalWeight > 0
+        and weightedSeparation / totalWeight
+        or 0
+    local alignment = candidateDirection:Dot(baseDirection)
+    return separationScore * 0.13 + alignment * 1.8 - pathLength * 0.022
+end
+local function requestEscapePath(activeThreats, directDirection, escapeBias)
+    if not CONFIG.PATHFINDING_ENABLED or pathRequestInFlight then
+        return
+    end
+    if not rootPart or not character or not alive or not humanoid then
+        return
+    end
+    if humanoid.FloorMaterial == Enum.Material.Air then
+        return
+    end
+    local now = os.clock()
+    if now - lastPathRequest < CONFIG.PATH_RETRY_INTERVAL then
+        return
+    end
+    local baseDirection = escapeBias.Magnitude > 0.001 and escapeBias or directDirection
+    baseDirection = unitOrZero(baseDirection)
+    if baseDirection.Magnitude < 0.001 then
+        local nearestThreat
+        local nearestDistance = math.huge
+        for _, threat in ipairs(activeThreats) do
+            if threat.Distance < nearestDistance then
+                nearestDistance = threat.Distance
+                nearestThreat = threat
+            end
+        end
+        if nearestThreat then
+            baseDirection = unitOrZero(-nearestThreat.Direction)
+        end
+    end
+    if baseDirection.Magnitude < 0.001 then
+        return
+    end
+    local side = Vector3.new(-baseDirection.Z, 0, baseDirection.X)
+    local candidates = {}
+    addUniqueDirection(candidates, baseDirection)
+    addUniqueDirection(candidates, directDirection)
+    addUniqueDirection(candidates, (baseDirection + side * 0.82).Unit)
+    addUniqueDirection(candidates, (baseDirection - side * 0.82).Unit)
+    while #candidates > CONFIG.PATH_CANDIDATES do
+        table.remove(candidates)
+    end
+    local snapshots = {}
+    for _, threat in ipairs(activeThreats) do
+        if threat.Root and threat.Root.Parent then
+            table.insert(snapshots, {
+                Position = threat.Root.Position,
+                Velocity = clampHorizontal(threat.Velocity, 32),
+                Weight = threat.Weight,
+            })
+        end
+    end
+    local requestGeneration = pathRequestGeneration + 1
+    pathRequestGeneration = requestGeneration
+    pathRequestInFlight = true
+    lastPathRequest = now
+    pathNeedsReplan = true
+    local requestCharacter = character
+    local startPosition = rootPart.Position
+    local baseSnapshot = baseDirection
+    task.spawn(function()
+        local bestPath = nil
+        local bestWaypoints = nil
+        local bestGoal = nil
+        local bestScore = -math.huge
+        local currentCandidatePath = nil
+        local ok, err = pcall(function()
+            for _, direction in ipairs(candidates) do
+                if requestGeneration ~= pathRequestGeneration
+                    or PlayerScripts:GetAttribute(OWNER_ATTRIBUTE) ~= OWNER_TOKEN
+                    or character ~= requestCharacter
+                    or not alive then
+                    break
+                end
+                local goal = startPosition + direction * CONFIG.PATH_GOAL_DISTANCE
+                local createOK, pathOrError = pcall(function()
+                    local agentParameters = {
+                        AgentRadius = CONFIG.PATH_AGENT_RADIUS,
+                        AgentHeight = CONFIG.PATH_AGENT_HEIGHT,
+                        AgentCanJump = CONFIG.PATH_AGENT_CAN_JUMP and canCharacterJump(),
+                        AgentCanClimb = CONFIG.PATH_AGENT_CAN_CLIMB,
+                        WaypointSpacing = CONFIG.PATH_WAYPOINT_SPACING,
+                    }
+                    if CONFIG.AVOID_WATER then
+                        agentParameters.Costs = {
+                            Water = math.huge,
+                        }
+                    end
+                    return PathfindingService:CreatePath(agentParameters)
+                end)
+                if createOK and pathOrError then
+                    currentCandidatePath = pathOrError
+                    local computeOK = pcall(function()
+                        currentCandidatePath:ComputeAsync(startPosition, goal)
+                    end)
+                    if requestGeneration ~= pathRequestGeneration
+                        or PlayerScripts:GetAttribute(OWNER_ATTRIBUTE) ~= OWNER_TOKEN
+                        or character ~= requestCharacter
+                        or not alive then
+                        pcall(function() currentCandidatePath:Destroy() end)
+                        currentCandidatePath = nil
+                        break
+                    end
+                    if computeOK
+                        and currentCandidatePath.Status == Enum.PathStatus.Success then
+                        local waypoints = currentCandidatePath:GetWaypoints()
+                        if #waypoints >= 2 then
+                            local score = pathFitness(
+                                waypoints,
+                                direction,
+                                baseSnapshot,
+                                snapshots
+                            )
+                            if score > bestScore then
+                                if bestPath then
+                                    pcall(function() bestPath:Destroy() end)
+                                end
+                                bestPath = currentCandidatePath
+                                bestWaypoints = waypoints
+                                bestGoal = waypoints[#waypoints].Position
+                                bestScore = score
+                                currentCandidatePath = nil
+                            end
+                        end
+                    end
+                    if currentCandidatePath then
+                        pcall(function() currentCandidatePath:Destroy() end)
+                        currentCandidatePath = nil
+                    end
+                end
+            end
+        end)
+        if currentCandidatePath then
+            pcall(function() currentCandidatePath:Destroy() end)
+        end
+        if requestGeneration ~= pathRequestGeneration
+            or PlayerScripts:GetAttribute(OWNER_ATTRIBUTE) ~= OWNER_TOKEN then
+            if bestPath then
+                pcall(function() bestPath:Destroy() end)
+            end
+            return
+        end
+        pathRequestInFlight = false
+        if not ok then
+            if bestPath then
+                pcall(function() bestPath:Destroy() end)
+            end
+            pathNeedsReplan = false
+            if CONFIG.DEBUG then
+                warn("[SurvivalAI] Path calculation error:", err)
+            end
+            return
+        end
+        local startDrift = rootPart and rootPart.Parent
+            and (rootPart.Position - startPosition).Magnitude
+            or math.huge
+        if not alive or character ~= requestCharacter
+            or startDrift > CONFIG.PATH_START_DRIFT_LIMIT then
+            if bestPath then
+                pcall(function() bestPath:Destroy() end)
+            end
+            destroyActivePath()
+            pathNeedsReplan = false
+            setStatus("Маршрут устарел — продолжаю")
+            updateGui()
+            return
+        end
+        if bestPath and bestWaypoints then
+            destroyActivePath()
+            activePath = bestPath
+            pathWaypoints = bestWaypoints
+            pathIndex = math.min(2, #pathWaypoints)
+            pathGoal = bestGoal
+            pathNeedsReplan = false
+            lastPathJumpIndex = -1
+            activePathBlockedConnection = activePath.Blocked:Connect(function(blockedWaypointIndex)
+                if activePath and blockedWaypointIndex >= pathIndex then
+                    pathNeedsReplan = true
+                    setStatus("Маршрут закрыт — ищу обход")
+                end
+            end)
+            setStatus("Обхожу препятствие")
+        else
+            destroyActivePath()
+            pathNeedsReplan = false
+            setStatus("Пробую другой угол")
+        end
+        updateGui()
+    end)
+end
+local function getPathDirection()
+    if not activePath or pathNeedsReplan or #pathWaypoints < 2 or not rootPart then
+        return nil
+    end
+    while pathIndex <= #pathWaypoints do
+        local waypoint = pathWaypoints[pathIndex]
+        local offset = waypoint.Position - rootPart.Position
+        local flatDistance = horizontal(offset).Magnitude
+        local verticalDifference = math.abs(offset.Y)
+        if waypoint.Action == Enum.PathWaypointAction.Jump
+            and lastPathJumpIndex ~= pathIndex
+            and flatDistance <= CONFIG.PATH_JUMP_TRIGGER_DISTANCE
+            and humanoid
+            and humanoid.FloorMaterial ~= Enum.Material.Air
+            and canCharacterJump() then
+            humanoid.Jump = true
+            lastPathJumpIndex = pathIndex
+        end
+        local closeEnough = flatDistance <= CONFIG.PATH_REACHED_DISTANCE
+            and verticalDifference <= 6
+        if closeEnough then
+            if pathIndex >= #pathWaypoints then
+                destroyActivePath()
+                return nil
+            end
+            pathIndex = pathIndex + 1
+            lastPathJumpIndex = -1
+        else
+            break
+        end
+    end
+    local waypoint = pathWaypoints[pathIndex]
+    if not waypoint then
+        destroyActivePath()
+        return nil
+    end
+    local direction = unitOrZero(waypoint.Position - rootPart.Position)
+    -- v1.0: blend toward the next waypoint near a corner so route
+    -- following arcs smoothly instead of snapping at right angles.
+    local nextWaypoint = pathWaypoints[pathIndex + 1]
+    local flatToWaypoint = horizontal(
+        waypoint.Position - rootPart.Position
+    ).Magnitude
+    if nextWaypoint and direction.Magnitude > 0.001
+        and flatToWaypoint < CONFIG.PATH_CORNER_BLEND_DISTANCE then
+        local nextDirection = unitOrZero(nextWaypoint.Position - rootPart.Position)
+        if nextDirection.Magnitude > 0.001 then
+            local blend = 1 - flatToWaypoint / CONFIG.PATH_CORNER_BLEND_DISTANCE
+            direction = unitOrZero(direction + nextDirection * blend * 0.85)
+        end
+    end
+    return direction
+end
+local function pathGoalStillLooksSafe(activeThreats)
+    if not pathGoal then
+        return true
+    end
+    for _, threat in ipairs(activeThreats) do
+        if threat.Root and threat.Root.Parent then
+            local predictedThreat = threat.Root.Position
+                + clampHorizontal(threat.Velocity, 32) * 0.7
+            local endDistance = horizontal(pathGoal - predictedThreat).Magnitude
+            if endDistance < CONFIG.EMERGENCY_DISTANCE then
+                return false
+            end
+        end
+    end
+    return true
+end
+--==============================================================
+-- STUCK DETECTION
+--==============================================================
+local function checkProgress(now)
+    if not rootPart or not humanoid then
+        return false
+    end
+    if now - lastProgressCheck < CONFIG.STUCK_CHECK_INTERVAL then
+        return false
+    end
+    lastProgressCheck = now
+    local position = rootPart.Position
+    local stuckNow = false
+    if progressPosition and commandDirection.Magnitude > 0.2
+        and humanoid.FloorMaterial ~= Enum.Material.Air then
+        local progress = horizontal(position - progressPosition).Magnitude
+        local speed = horizontal(rootPart.AssemblyLinearVelocity).Magnitude
+        if progress < CONFIG.STUCK_MIN_PROGRESS
+            and speed < CONFIG.STUCK_SPEED_LIMIT then
+            stuckDirection = commandDirection
+            stuckUntil = now + CONFIG.STUCK_PENALTY_TIME
+            stuckStatusUntil = now + 0.9
+            stuckNow = true
+            setStatus("Застрял — ищу другой путь")
+        end
+    end
+    progressPosition = position
+    return stuckNow
+end
+--==============================================================
+-- PRO-PLAYER MOVEMENT LAYER (v1.0)
+-- Serpentine runs, orbit strafing, juke feints, jump-dodges and
+-- the clutch CPA sidestep. Style is always subordinate to
+-- survival: every flashy direction is safety-checked first.
+--==============================================================
+local function scheduleNextJuke(now)
+    local minInterval = CONFIG.JUKE_MIN_INTERVAL
+    local maxInterval = CONFIG.JUKE_MAX_INTERVAL
+    if panicMode then
+        minInterval = minInterval * CONFIG.PANIC_JUKE_SPEEDUP
+        maxInterval = maxInterval * CONFIG.PANIC_JUKE_SPEEDUP
+    end
+    nextJukeAt = now + jukeRandom:NextNumber(minInterval, maxInterval)
+end
+local function tryStartJuke(now, nearestDistance, emergency)
+    if now < nextJukeAt then
+        return
+    end
+    if nearestDistance > CONFIG.JUKE_TRIGGER_MAX_DISTANCE then
+        scheduleNextJuke(now)
+        return
+    end
+    if emergency and jukeRandom:NextNumber() > CONFIG.JUKE_EMERGENCY_BIAS then
+        scheduleNextJuke(now)
+        return
+    end
+    scheduleNextJuke(now)
+    local duration = jukeRandom:NextNumber(
+        CONFIG.JUKE_DURATION_MIN,
+        CONFIG.JUKE_DURATION_MAX
+    )
+    jukeActiveUntil = now + duration
+    jukeCounterAt = now + duration * jukeRandom:NextNumber(0.35, 0.55)
+    jukeCountered = false
+    jukePendingSide = jukeRandom:NextInteger(1, 2) == 1 and 1 or -1
+    jukeIsReverse = (not emergency)
+        and jukeRandom:NextNumber() < CONFIG.JUKE_REVERSE_CHANCE
+end
+local function maybeJumpDodge(now, activeThreats, emergency)
+    if not CONFIG.JUMP_DODGE_ENABLED then
+        return
+    end
+    if not humanoid or not humanoid.Parent or not canCharacterJump() then
+        return
+    end
+    if now < nextJumpDodgeAt then
+        return
+    end
+    if humanoid.FloorMaterial == Enum.Material.Air then
+        return
+    end
+    local nearestDistance = calculateNearestDistance(activeThreats)
+    if nearestDistance > CONFIG.JUMP_DODGE_TRIGGER_DISTANCE then
+        return
+    end
+    local dodgeChance = emergency
+        and CONFIG.JUMP_DODGE_CHANCE * 1.35
+        or CONFIG.JUMP_DODGE_CHANCE
+    if panicMode then
+        dodgeChance = dodgeChance * CONFIG.PANIC_JUMP_BOOST
+    end
+    if jukeRandom:NextNumber() <= math.min(dodgeChance, 1) then
+        humanoid.Jump = true
+    end
+    nextJumpDodgeAt = now + jukeRandom:NextNumber(
+        CONFIG.JUMP_DODGE_COOLDOWN_MIN,
+        CONFIG.JUMP_DODGE_COOLDOWN_MAX
+    )
+end
+-- v1.0: Closest Point of Approach — when will a threat nearly touch us
+-- if both keep current velocities? This is the math behind pro dodges.
+local function calculateCPA(threat)
+    if not rootPart or not rootPart.Parent then
+        return nil
+    end
+    if not threat.Root or not threat.Root.Parent then
+        return nil
+    end
+    local relativePosition = horizontal(threat.Root.Position - rootPart.Position)
+    local myVelocity = clampHorizontal(rootPart.AssemblyLinearVelocity, 40)
+    local relativeVelocity = clampHorizontal(threat.Velocity, 32) - myVelocity
+    local velocitySquared = relativeVelocity:Dot(relativeVelocity)
+    if velocitySquared < 0.5 then
+        return nil
+    end
+    local cpaTime = -relativePosition:Dot(relativeVelocity) / velocitySquared
+    if cpaTime < 0 then
+        return nil
+    end
+    local closestVector = relativePosition + relativeVelocity * cpaTime
+    return cpaTime, closestVector.Magnitude
+end
+local function tryClutchDodge(now, activeThreats)
+    if not CONFIG.CLUTCH_DODGE_ENABLED then
+        return
+    end
+    if now < clutchActiveUntil then
+        return
+    end
+    if now - lastClutchDodge < CONFIG.CLUTCH_DODGE_COOLDOWN then
+        return
+    end
+    if now - lastClutchCheck < CONFIG.CLUTCH_CHECK_INTERVAL then
+        return
+    end
+    lastClutchCheck = now
+    if not rootPart or not rootPart.Parent then
+        return
+    end
+    if not raycastParams then
+        rebuildRaycastParams()
+    end
+    local position = rootPart.Position
+    local groundY = getCurrentGroundY(position, raycastParams)
+    local escapeBias = calculateEscapeBias(activeThreats)
+    for _, threat in ipairs(activeThreats) do
+        local cpaTime, cpaDistance = calculateCPA(threat)
+        if cpaTime
+            and cpaTime >= CONFIG.CLUTCH_CPA_TIME_MIN
+            and cpaTime <= CONFIG.CLUTCH_CPA_TIME_MAX
+            and cpaDistance <= CONFIG.CLUTCH_CPA_DISTANCE then
+            local incoming = unitOrZero(threat.Velocity)
+            if incoming.Magnitude < 0.001 then
+                incoming = threat.Direction
+            end
+            if incoming.Magnitude > 0.001 then
+                local sideA = unitOrZero(Vector3.new(-incoming.Z, 0, incoming.X))
+                local sideB = -sideA
+                local function sideViable(sideDirection)
+                    if sideDirection.Magnitude < 0.001 then
+                        return false
+                    end
+                    return hasSafeGround(
+                            position, sideDirection, raycastParams, groundY
+                        )
+                        and clearanceScore(
+                            position, sideDirection, raycastParams, false
+                        ) > 0.30
+                end
+                local aViable = sideViable(sideA)
+                local bViable = sideViable(sideB)
+                local chosen
+                if aViable and bViable then
+                    chosen = sampleOpenness(sideA) >= sampleOpenness(sideB)
+                        and sideA or sideB
+                elseif aViable then
+                    chosen = sideA
+                elseif bViable then
+                    chosen = sideB
+                end
+                if chosen then
+                    local blended = chosen
+                    if escapeBias.Magnitude > 0.001 then
+                        blended = unitOrZero(
+                            chosen * (1 - CONFIG.CLUTCH_ESCAPE_BLEND)
+                                + escapeBias * CONFIG.CLUTCH_ESCAPE_BLEND
+                        )
+                    end
+                    if blended.Magnitude > 0.001 then
+                        clutchDirection = blended
+                        clutchActiveUntil = now + CONFIG.CLUTCH_DODGE_DURATION
+                        lastClutchDodge = now
+                        return
+                    end
+                end
+            end
+        end
+    end
+end
+local function applyProMovement(desiredDirection, activeThreats, now, emergency)
+    if desiredDirection.Magnitude < 0.001 or #activeThreats == 0 then
+        return desiredDirection
+    end
+    if not rootPart or not rootPart.Parent then
+        return desiredDirection
+    end
+    if not raycastParams then
+        rebuildRaycastParams()
+    end
+    -- 0) CLUTCH DODGE: last-moment CPA sidestep beats every other style.
+    tryClutchDodge(now, activeThreats)
+    if now < clutchActiveUntil and clutchDirection.Magnitude > 0.001 then
+        return clutchDirection
+    end
+    local result = desiredDirection
+    local nearestDistance = calculateNearestDistance(activeThreats)
+    if not emergency then
+        -- 1) Serpentine run: dual harmonic with a drifting frequency.
+        if CONFIG.SERPENTINE_ENABLED then
+            if now >= nextSerpentineFrequencyChange then
+                serpentineFrequency = jukeRandom:NextNumber(
+                    CONFIG.SERPENTINE_FREQ_MIN,
+                    CONFIG.SERPENTINE_FREQ_MAX
+                )
+                nextSerpentineFrequencyChange = now + jukeRandom:NextNumber(
+                    CONFIG.SERPENTINE_FREQ_CHANGE_MIN,
+                    CONFIG.SERPENTINE_FREQ_CHANGE_MAX
+                )
+            end
+            local scale = math.clamp(
+                (nearestDistance - CONFIG.EMERGENCY_DISTANCE) / 28, 0, 1
+            )
+            if getHealthRatio() <= CONFIG.LOW_HEALTH_RATIO then
+                scale = scale * 0.35
+            end
+            local amplitude = CONFIG.SERPENTINE_BASE_AMPLITUDE
+            if panicMode then
+                amplitude = amplitude * CONFIG.PANIC_SERPENTINE_BOOST
+            end
+            local side = Vector3.new(-result.Z, 0, result.X)
+            local wave = math.sin(now * serpentineFrequency + weavePhase)
+            local wave2 = math.sin(
+                now * serpentineFrequency * 2.13 + weavePhase * 1.7
+            ) * CONFIG.SERPENTINE_SECOND_HARMONIC
+            local waved = unitOrZero(
+                result + side * (wave + wave2) * amplitude * scale
+            )
+            if waved.Magnitude > 0.001 then
+                result = waved
+            end
+        end
+        -- 2) Orbit strafe: arc around the nearest threat at mid range.
+        if CONFIG.STRAFE_ENABLED
+            and nearestDistance >= CONFIG.STRAFE_DISTANCE_MIN
+            and nearestDistance <= CONFIG.STRAFE_DISTANCE_MAX then
+            if now >= nextStrafeFlip then
+                strafeSide = -strafeSide
+                nextStrafeFlip = now + jukeRandom:NextNumber(
+                    CONFIG.STRAFE_SIDE_FLIP_MIN,
+                    CONFIG.STRAFE_SIDE_FLIP_MAX
+                )
+            end
+            local nearestThreat
+            local nearestThreatDistance = math.huge
+            for _, threat in ipairs(activeThreats) do
+                if threat.Distance < nearestThreatDistance then
+                    nearestThreatDistance = threat.Distance
+                    nearestThreat = threat
+                end
+            end
+            if nearestThreat and nearestThreat.Direction.Magnitude > 0.001 then
+                local tangent = Vector3.new(
+                    -nearestThreat.Direction.Z, 0, nearestThreat.Direction.X
+                ) * strafeSide
+                local mid = (CONFIG.STRAFE_DISTANCE_MIN
+                    + CONFIG.STRAFE_DISTANCE_MAX) * 0.5
+                local halfSpan = (CONFIG.STRAFE_DISTANCE_MAX
+                    - CONFIG.STRAFE_DISTANCE_MIN) * 0.5
+                local strafeScale = math.clamp(
+                    1 - math.abs(nearestDistance - mid)
+                        / math.max(halfSpan, 0.001),
+                    0, 1
+                )
+                local strafed = unitOrZero(
+                    result + tangent * CONFIG.STRAFE_WEIGHT * strafeScale
+                )
+                if strafed.Magnitude > 0.001 then
+                    result = strafed
+                end
+            end
+        end
+    end
+    -- 3) Juke: sudden short burst sideways (or a bait step back)
+    --    with a mid-juke counter-flip — the classic pro feint.
+    local jukeAllowed = nearestDistance > CONFIG.EMERGENCY_DISTANCE
+    if CONFIG.JUKE_ENABLED and jukeAllowed then
+        tryStartJuke(now, nearestDistance, emergency)
+        if now < jukeActiveUntil then
+            if not jukeCountered and now >= jukeCounterAt then
+                jukeCountered = true
+                jukePendingSide = -jukePendingSide
+            end
+            local side = Vector3.new(
+                -desiredDirection.Z, 0, desiredDirection.X
+            ) * jukePendingSide
+            local jukeDir
+            if jukeIsReverse and not jukeCountered and not emergency then
+                jukeDir = unitOrZero(-desiredDirection * 0.55 + side * 0.85)
+            else
+                jukeDir = unitOrZero(side)
+            end
+            if jukeDir.Magnitude > 0.001 then
+                local position = rootPart.Position
+                local currentGroundY = getCurrentGroundY(position, raycastParams)
+                local safe = hasSafeGround(
+                        position, jukeDir, raycastParams, currentGroundY
+                    )
+                    and clearanceScore(
+                        position, jukeDir, raycastParams, false
+                    ) > 0.22
+                if not safe then
+                    local opposite = unitOrZero(-side)
+                    safe = hasSafeGround(
+                            position, opposite, raycastParams, currentGroundY
+                        )
+                        and clearanceScore(
+                            position, opposite, raycastParams, false
+                        ) > 0.22
+                    if safe then
+                        jukeDir = opposite
+                    else
+                        jukeDir = nil
+                    end
+                end
+                if jukeDir then
+                    result = jukeDir
+                end
+            end
+        end
+    end
+    return result
+end
+--==============================================================
+-- CHARACTER LIFECYCLE
+--==============================================================
+local function stopCharacterControl()
+    alive = false
+    plannedDirection = Vector3.zero
+    selectedDirection = Vector3.zero
+    commandDirection = Vector3.zero
+    commandVelocity = Vector3.zero
+    lastKnownGroundY = nil
+    if humanoid and humanoid.Parent and wasControllingMovement then
+        pcall(function()
+            humanoid:Move(Vector3.zero, false)
+        end)
+    end
+    table.clear(threats)
+    table.clear(activeThreatsCache)
+    disconnectAll(characterConnections)
+    cancelPathfinding()
+    resetProMovementState()
+    character = nil
+    humanoid = nil
+    rootPart = nil
+    wasControllingMovement = false
+    progressPosition = nil
+    stuckDirection = Vector3.zero
+    stuckUntil = 0
+    stuckStatusUntil = 0
+    rebuildRaycastParams()
+end
+local function setupCharacter(newCharacter)
+    characterGeneration = characterGeneration + 1
+    local generation = characterGeneration
+    stopCharacterControl()
+    character = newCharacter
+    rebuildRaycastParams()
+    local newHumanoid = newCharacter:WaitForChild("Humanoid", 10)
+    local newRoot = newCharacter:FindFirstChild("HumanoidRootPart")
+    if not newRoot and newHumanoid then
+        newRoot = newHumanoid.RootPart
+    end
+    if not newRoot then
+        newRoot = newCharacter:WaitForChild("HumanoidRootPart", 3)
+    end
+    if not newRoot and newHumanoid then
+        newRoot = newHumanoid.RootPart
+    end
+    if shuttingDown or generation ~= characterGeneration
+        or LocalPlayer.Character ~= newCharacter then
+        return
+    end
+    if not newHumanoid or not newRoot then
+        setStatus("Персонаж не готов")
+        updateGui()
+        return
+    end
+    humanoid = newHumanoid
+    rootPart = newRoot
+    alive = humanoid.Health > 0
+    lastHealthValue = humanoid.Health
+    plannedDirection = Vector3.zero
+    selectedDirection = Vector3.zero
+    commandDirection = Vector3.zero
+    commandVelocity = Vector3.zero
+    lastKnownGroundY = nil
+    wasControllingMovement = false
+    lastScan = 0
+    lastThink = 0
+    lastProgressCheck = os.clock()
+    progressPosition = rootPart.Position
+    rebuildRaycastParams()
+    getCurrentGroundY(rootPart.Position, raycastParams)
+    table.insert(characterConnections, humanoid.Died:Connect(function()
+        alive = false
+        plannedDirection = Vector3.zero
+        selectedDirection = Vector3.zero
+        commandDirection = Vector3.zero
+        commandVelocity = Vector3.zero
+        table.clear(threats)
+        table.clear(activeThreatsCache)
+        cancelPathfinding()
+        resetProMovementState()
+        setStatus("Ждём респавн")
+        updateGui()
+    end))
+    setStatus(alive and "Готов к выживанию" or "Ждём респавн")
+    updateGui()
+end
+local function removeCharacter()
+    characterGeneration = characterGeneration + 1
+    stopCharacterControl()
+    setStatus("Ждём респавн")
+    updateGui()
+end
+--==============================================================
+-- ENABLE / DISABLE
+--==============================================================
+setEnabled = function(value)
+    if PlayerScripts:GetAttribute(OWNER_ATTRIBUTE) ~= OWNER_TOKEN then
+        return
+    end
+    enabled = value
+    plannedDirection = Vector3.zero
+    selectedDirection = Vector3.zero
+    commandDirection = Vector3.zero
+    wasControllingMovement = false
+    stuckDirection = Vector3.zero
+    stuckUntil = 0
+    stuckStatusUntil = 0
+    lastScan = 0
+    lastThink = 0
+    lastProgressCheck = os.clock()
+    progressPosition = rootPart and rootPart.Position or nil
+    table.clear(threats)
+    table.clear(activeThreatsCache)
+    resetProMovementState()
+    if humanoid and humanoid.Parent then
+        lastHealthValue = humanoid.Health
+    end
+    if not enabled then
+        cancelPathfinding()
+        if humanoid and humanoid.Parent then
+            pcall(function()
+                humanoid:Move(Vector3.zero, false)
+            end)
+        end
+        setStatus("Обычное управление")
+    else
+        setStatus(alive and "Ищу угрозы" or "Жду персонажа")
+    end
+    updateGui()
+end
+table.insert(generalConnections, UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then
+        return
+    end
+    if input.KeyCode == CONFIG.TOGGLE_KEY then
+        setEnabled(not enabled)
+    end
+end))
+--==============================================================
+-- MAIN UPDATE
+--==============================================================
+local BIND_NAME = "SurvivalAI_Pirozhok_Control_" .. tostring(LocalPlayer.UserId)
+RunService:UnbindFromRenderStep(BIND_NAME)
+RunService:UnbindFromRenderStep("SurvivalAI_Pirozhok_Control")
+local function updatePlanning()
+    if shuttingDown
+        or PlayerScripts:GetAttribute(OWNER_ATTRIBUTE) ~= OWNER_TOKEN then
+        plannedDirection = Vector3.zero
+        return
+    end
+    if not enabled or not alive then
+        plannedDirection = Vector3.zero
+        return
+    end
+    if not character or not character.Parent
+        or not humanoid or not humanoid.Parent
+        or not rootPart or not rootPart.Parent
+        or humanoid.Health <= 0 then
+        plannedDirection = Vector3.zero
+        return
+    end
+    if humanoid.Sit or humanoid.PlatformStand then
+        plannedDirection = Vector3.zero
+        commandDirection = Vector3.zero
+        commandVelocity = Vector3.zero
+        selectedDirection = Vector3.zero
+        wasControllingMovement = false
+        if activePath or pathRequestInFlight or pathNeedsReplan then
+            cancelPathfinding()
+        end
+        setStatus("Не могу двигаться")
+        updateGui()
+        return
+    end
+    local now = os.clock()
+    if now - lastScan >= CONFIG.SCAN_INTERVAL then
+        lastScan = now
+        local ok, err = pcall(scanThreats)
+        if not ok then
+            table.clear(threats)
+            setStatus("Ошибка обнаружения")
+            if CONFIG.DEBUG then
+                warn("[SurvivalAI] Scan error:", err)
+            end
+        end
+    end
+    if now - lastThink >= CONFIG.THINK_INTERVAL then
+        lastThink = now
+        local stuckNow = checkProgress(now)
+        activeThreatsCache = getActiveThreats()
+        local activeThreats = activeThreatsCache
+        -- v1.0: panic adaptation — taking damage near threats makes the
+        -- AI temporarily play harder (faster jukes, wider serpentine).
+        if CONFIG.PANIC_ENABLED and humanoid and humanoid.Parent then
+            local healthNow = humanoid.Health
+            if lastHealthValue ~= nil
+                and healthNow <= lastHealthValue - CONFIG.PANIC_HEALTH_DROP
+                and #activeThreats > 0 then
+                panicUntil = now + CONFIG.PANIC_DURATION
+            end
+            lastHealthValue = healthNow
+        end
+        panicMode = now < panicUntil
+        if #activeThreats > 0 then
+            if now >= nextWeaveFlip then
+                weaveSign = weaveSign * -1
+                nextWeaveFlip = now + randomGenerator:NextNumber(
+                    CONFIG.WEAVE_SWITCH_MIN,
+                    CONFIG.WEAVE_SWITCH_MAX
+                )
+            end
+            local ok, direction, status, needsPath = pcall(
+                chooseEscapeDirection, activeThreats
+            )
+            if ok then
+                selectedDirection = typeof(direction) == "Vector3"
+                    and direction or Vector3.zero
+                if now < stuckStatusUntil then
+                    setStatus("Застрял — ищу другой путь")
+                elseif status then
+                    setStatus(status)
+                end
+                if stuckNow or selectedDirection.Magnitude < 0.001
+                    or pathNeedsReplan or needsPath then
+                    requestEscapePath(
+                        activeThreats,
+                        selectedDirection,
+                        calculateEscapeBias(activeThreats)
+                    )
+                end
+            else
+                selectedDirection = Vector3.zero
+                setStatus("Ошибка выбора пути")
+                if CONFIG.DEBUG then
+                    warn("[SurvivalAI] Decision error:", direction)
+                end
+                requestEscapePath(
+                    activeThreats,
+                    Vector3.zero,
+                    calculateEscapeBias(activeThreats)
+                )
+            end
+        else
+            selectedDirection = Vector3.zero
+            if #threats > 0 then
+                setStatus("Наблюдаю издали")
+            else
+                setStatus("Рядом спокойно")
+            end
+            stuckDirection = Vector3.zero
+            stuckUntil = 0
+            if activePath or pathRequestInFlight or pathNeedsReplan then
+                cancelPathfinding()
+            end
+        end
+        updateGui()
+    end
+    local activeThreats = activeThreatsCache
+    local directDirection = selectedDirection
+    local emergency = #activeThreats > 0 and isEmergency(activeThreats)
+    local pathLooksSafe = #activeThreats > 0
+        and pathGoalStillLooksSafe(activeThreats)
+    if activePath and not pathLooksSafe then
+        pathNeedsReplan = true
+    end
+    local mayUsePath = #activeThreats > 0
+        and not pathNeedsReplan
+        and pathLooksSafe
+        and (not emergency or directDirection.Magnitude < 0.001)
+    local pathDirection = nil
+    if mayUsePath then
+        pathDirection = getPathDirection()
+    end
+    local desiredDirection = pathDirection or directDirection
+    -- PRO LAYER: style is applied on top of the tactical decision,
+    -- never while following a computed path route.
+    if desiredDirection.Magnitude > 0.001 and #activeThreats > 0 then
+        if not pathDirection then
+            local okPro, proDirection = pcall(
+                applyProMovement, desiredDirection, activeThreats, now, emergency
+            )
+            if okPro then
+                if typeof(proDirection) == "Vector3"
+                    and proDirection.Magnitude > 0.001 then
+                    desiredDirection = proDirection
+                end
+            elseif CONFIG.DEBUG then
+                warn("[SurvivalAI] Pro movement error:", proDirection)
+            end
+        end
+        maybeJumpDodge(now, activeThreats, emergency)
+    end
+    plannedDirection = desiredDirection
+end
+table.insert(generalConnections, RunService.Heartbeat:Connect(updatePlanning))
+RunService:BindToRenderStep(
+    BIND_NAME,
+    Enum.RenderPriority.Character.Value + 1,
+    function(deltaTime)
+        if shuttingDown
+            or PlayerScripts:GetAttribute(OWNER_ATTRIBUTE) ~= OWNER_TOKEN then
+            return
+        end
+        if not enabled or not alive
+            or not character or not character.Parent
+            or not humanoid or not humanoid.Parent
+            or not rootPart or not rootPart.Parent
+            or humanoid.Health <= 0 then
+            commandDirection = Vector3.zero
+            commandVelocity = Vector3.zero
+            if humanoid and humanoid.Parent and wasControllingMovement then
+                pcall(function()
+                    humanoid:Move(Vector3.zero, false)
+                end)
+                wasControllingMovement = false
+            end
+            return
+        end
+        if humanoid.Sit or humanoid.PlatformStand then
+            commandDirection = Vector3.zero
+            commandVelocity = Vector3.zero
+            wasControllingMovement = false
+            return
+        end
+        local desiredDirection = plannedDirection
+        if desiredDirection.Magnitude > 0.001 then
+            local dt = math.clamp(deltaTime, 0, 0.1)
+            local emergency = #activeThreatsCache > 0
+                and isEmergency(activeThreatsCache)
+            local nowClock = os.clock()
+            local jukeActive = nowClock < jukeActiveUntil
+            local clutchActive = nowClock < clutchActiveUntil
+            local response
+            if emergency then
+                response = CONFIG.EMERGENCY_TURN_RESPONSE
+            elseif clutchActive then
+                response = CONFIG.CLUTCH_TURN_RESPONSE
+            elseif jukeActive then
+                response = CONFIG.JUKE_TURN_RESPONSE
+            else
+                response = CONFIG.TURN_RESPONSE
+            end
+            if CONFIG.SPRING_SMOOTHING_ENABLED then
+                -- v1.0: critically damped spring steering, substepped for
+                -- stability. Gives human-like acceleration into turns and
+                -- snappy recovery after jukes instead of a robotic lerp.
+                local omega = response
+                local zeta = CONFIG.SPRING_DAMPING_RATIO
+                local remaining = dt
+                local iterations = 0
+                while remaining > 0.0001 and iterations < 8 do
+                    local step = math.min(remaining, 1 / 120)
+                    remaining = remaining - step
+                    iterations = iterations + 1
+                    local accel =
+                        (desiredDirection - commandDirection) * (omega * omega)
+                        - commandVelocity * (2 * zeta * omega)
+                    commandVelocity = commandVelocity + accel * step
+                    if commandVelocity.Magnitude > 30 then
+                        commandVelocity = commandVelocity.Unit * 30
+                    end
+                    commandDirection = commandDirection + commandVelocity * step
+                end
+                if commandDirection.Magnitude > 1.25 then
+                    commandDirection = commandDirection.Unit * 1.25
+                end
+            else
+                local alpha = 1 - math.exp(-response * dt)
+                if commandDirection.Magnitude < 0.001 then
+                    commandDirection = desiredDirection
+                else
+                    commandDirection = commandDirection:Lerp(desiredDirection, alpha)
+                end
+            end
+            commandDirection = unitOrZero(commandDirection)
+            humanoid:Move(commandDirection, false)
+            wasControllingMovement = true
+        elseif #activeThreatsCache > 0 then
+            commandDirection = Vector3.zero
+            commandVelocity = Vector3.zero
+            humanoid:Move(Vector3.zero, false)
+            wasControllingMovement = true
+        else
+            commandDirection = Vector3.zero
+            commandVelocity = Vector3.zero
+            if wasControllingMovement then
+                humanoid:Move(Vector3.zero, false)
+                wasControllingMovement = false
+            end
+        end
+    end
+)
+--==============================================================
+-- STARTUP / CLEANUP
+--==============================================================
+table.insert(generalConnections, LocalPlayer.CharacterAdded:Connect(function(newCharacter)
+    task.spawn(setupCharacter, newCharacter)
+end))
+table.insert(generalConnections, LocalPlayer.CharacterRemoving:Connect(removeCharacter))
+if LocalPlayer.Character then
+    task.spawn(setupCharacter, LocalPlayer.Character)
+end
+updateGui()
+print("[SurvivalAI] Пирожок v1.0 loaded")
+script.Destroying:Connect(function()
+    shuttingDown = true
+    characterGeneration = characterGeneration + 1
+    plannedDirection = Vector3.zero
+    RunService:UnbindFromRenderStep(BIND_NAME)
+    disconnectAll(generalConnections)
+    disconnectAll(characterConnections)
+    disconnectAll(guiConnections)
+    table.clear(activeTouches)
+    finishDrag()
+    cancelPathfinding()
+    resetProMovementState()
+    if humanoid and humanoid.Parent then
+        pcall(function()
+            humanoid:Move(Vector3.zero, false)
+        end)
+    end
+    if screenGui and screenGui.Parent then
+        screenGui:Destroy()
+    end
+    if PlayerScripts:GetAttribute(OWNER_ATTRIBUTE) == OWNER_TOKEN then
+        PlayerScripts:SetAttribute(OWNER_ATTRIBUTE, nil)
+    end
+end)
+```
