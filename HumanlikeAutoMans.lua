@@ -1,4 +1,3 @@
-```lua
 --==============================================================
 -- SURVIVAL AI v1.0 — "Пирожок: Мастер мансов PRO"
 -- LocalScript -> StarterPlayer > StarterPlayerScripts
@@ -52,7 +51,7 @@ PlayerScripts:SetAttribute(OWNER_ATTRIBUTE, OWNER_TOKEN)
 -- CONFIGURATION
 --==============================================================
 local CONFIG = {
-    START_ENABLED = false,
+    START_ENABLED = true,
     TOGGLE_KEY = Enum.KeyCode.G,
     DETECTION_RADIUS = 68,
     FLEE_RADIUS = 43,
@@ -2586,4 +2585,3 @@ script.Destroying:Connect(function()
         PlayerScripts:SetAttribute(OWNER_ATTRIBUTE, nil)
     end
 end)
-```
