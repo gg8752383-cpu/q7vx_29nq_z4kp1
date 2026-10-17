@@ -1,7 +1,6 @@
---[[ HUMANLIKE AUTO-MANS v3.5-PORTABLE | LocalScript: StarterPlayer>StarterPlayerScripts
-РЕЖИМЫ: SURVIVE=убегает/выживает, COMBAT=не убегает, кружит. АВТО-БЕГА НЕТ (только idle-стрейф на месте).
-v3.5: орбита уважает EnemyAttackRange, PingSign=-1, MinRelSpeed=12, idle-jitter, реактивный прыжок,
-бонус укрытий от стрелков, kite-dash на 12 ст., фолбэк ближнего боя по скорости врага.
+--[[ HUMANLIKE AUTO-MANS v4.0-PREDATOR | LocalScript: StarterPlayer>StarterPlayerScripts
+РЕЖИМЫ: SURVIVE=убегает/выживает, COMBAT=не убегает, кружит.
+v4.0: Predator v2.0 (бинарный поиск, ускорение, хоминг), Weight Shifting (инерция, заносы), Tactical Flow (LOS Break).
 Порты: GuardIgnore, MeleeFallbackByApproach, DashWatchdog, ReasonAttribute, DashSpeedCap, ForceAllPlayersAsEnemies. ]]
 local Players=game:GetService("Players") local RunService=game:GetService("RunService")
 local Stats=game:GetService("Stats") local TweenService=game:GetService("TweenService")
@@ -32,6 +31,11 @@ FreshBeams=true, FreshWindow=0.4, BeamAspect=5, BeamMaxThickness=8, BeamLookahea
 DashDistance=15, DashMaxDistance=30, DashMinDistance=5, DashDuration=0.2, DashAvgSpeed=75,
 DashCooldown=0.85, DashForce=1e7, PostDashSettle=0.12, WallPadding=1.6, VoidCheckDepth=45,
 TreatZeroWalkSpeedAsStun=true, DetectRagdollConstraints=true, ExtraBlockCheck=nil, OnDodge=nil,
+-- 🚀 v4.0 PREDATOR & WEIGHT SHIFTING CONFIG
+LateralFriction=8.5,      -- Сила "вгрызания" в землю при боковом стрейфе
+BurstAccelMultiplier=1.8, -- Множитель ускорения для взрывного старта
+HesitationWindow=0.12,    -- Время "подготовки" перед сложным маневром
+CoverSearchDepth=15,      -- Глубина поиска стен для укрытия
 }
 local rng=Random.new()
 local Enabled=Config.StartEnabled
@@ -40,8 +44,10 @@ local pingMs=0 local fsm="Idle" local cachedReason=nil
 local MIN_SP2=Config.MinRelSpeed*Config.MinRelSpeed
 local ctx={char=nil,hum=nil,hrp=nil,lv=nil,att=nil,ao=nil,rayParams=nil,overlapParams=nil,conns={},
 dashing=false,dashStart=0,dashDur=0.2,dashDir=Vector3.zero,dashPeak=0,cooldownEnd=0,settleUntil=0,
-lastDirX=0,lastDirZ=0,lastDirTime=-10,nextJumpAt=0}
-local MV_DODGE,MV_MELEE,MV_UNSTICK=1,2,3
+lastDirX=0,lastDirZ=0,lastDirTime=-10,nextJumpAt=0,
+-- 🚀 v4.0 Weight Shifting Context
+velX=0, velZ=0, faceX=1, faceZ=0, lastHesitation=0}
+local MV_DODGE,MV_MELEE,MV_UNSTUCK=1,2,3
 local Ctl={active=false,facing=false,prevAutoRotate=true,heading=0,speed=0,
 wantX=0,wantZ=0,wantSpeed=0,wantTurn=480,
 mvActive=false,mvX=0,mvZ=0,mvUntil=0,mvSpeed=1,mvKind=0,threatUntil=0,
@@ -143,6 +149,11 @@ rec.dirx,rec.dirz,rec.hasDir=0,0,false rec.slowSince=0 rec.activeUntil=math.huge
 rec.gravity=false rec.accY=0
 rec.hitR,rec.radius,rec.safeR,rec.halfY=0,0,0,0
 rec.ox,rec.oy,rec.oz,rec.ax,rec.ay,rec.az,rec.blen,rec.lim=0,0,0,0,0,0,0,0
+-- 🚀 v4.0 Predator Fields
+rec.smoothVx, rec.smoothVy, rec.smoothVz = vx, vy, vz
+rec.prevVx, rec.prevVy, rec.prevVz = vx, vy, vz
+rec.accelX, rec.accelY, rec.accelZ = 0, 0, 0
+rec.isHoming = false
 if kind=="Proj" then
 rec.radius=math.min(m*0.5,Config.MaxProjectileRadius)
 rec.hitR=rec.radius+Config.BodyRadius+Config.HitMargin
@@ -173,10 +184,37 @@ else vx,vy,vz=rec.vx,rec.vy,rec.vz end
 rec.gravity=false
 else
 local v=part.AssemblyLinearVelocity vx,vy,vz=v.X,v.Y,v.Z
+-- 🚀 PREDATOR V2.0: Экспоненциальное сглаживание (убираем сетевой джиттер)
+local alpha = 0.65 
+local svx = rec.smoothVx * (1-alpha) + vx * alpha
+local svy = rec.smoothVy * (1-alpha) + vy * alpha
+local svz = rec.smoothVz * (1-alpha) + vz * alpha
+if dt>0.008 then
+local ax = (svx - rec.prevVx) / dt
+local ay = (svy - rec.prevVy) / dt
+local az = (svz - rec.prevVz) / dt
+rec.accelX = rec.accelX * 0.6 + ax * 0.4
+rec.accelY = rec.accelY * 0.6 + ay * 0.4
+rec.accelZ = rec.accelZ * 0.6 + az * 0.4
+rec.samples+=1
+if rec.samples>=4 then 
+rec.gravity=(rec.accelY < -0.3*Workspace.Gravity) and not rec.anchored and not hasMover(part)
+end
+-- 👁️ Детекция самонаведения (Homing Detection)
+local cf = part.CFrame
+local lv = cf.LookVector
+local speed = math.sqrt(svx*svx + svy*svy + svz*svz)
+if speed > 5 then
+local dot = (lv.X*svx + lv.Y*svy + lv.Z*svz) / speed
+rec.isHoming = (dot < 0.85)
+end
+end
+rec.prevVx, rec.prevVy, rec.prevVz = svx, svy, svz
+rec.smoothVx, rec.smoothVy, rec.smoothVz = svx, svy, svz
+vx, vy, vz = svx, svy, svz
 if dt>0.01 then
 rec.accY=rec.accY*0.7+((vy-rec.vy)/dt)*0.3
-rec.samples+=1
-if rec.samples>=4 then rec.gravity=rec.accY<-0.5*Workspace.Gravity end end end
+end end
 rec.vx,rec.vy,rec.vz=vx,vy,vz rec.t=now
 else
 local s=part.Size local m=math.max(s.X,s.Y,s.Z)
@@ -270,42 +308,74 @@ if not (w and w.next>scanIdx) then observePart(part,w,now,mvx,mvy,mvz,myRoot) en
 prune(now) end
 local function pushActive(rec) rec.urgent=true activeN+=1 active[activeN]=rec end
 local function evalProj(rec,mx,my,mz,mvx,mvy,mvz,pingSec,grav,now)
-local rvx,rvy,rvz=rec.vx-mvx,rec.vy-mvy,rec.vz-mvz
+-- 🚀 PREDATOR V2.0: Используем сглаженные данные и ускорение
+local rvx,rvy,rvz = rec.smoothVx-mvx, rec.smoothVy-mvy, rec.smoothVz-mvz
+local rax,ray,raz = rec.accelX, rec.accelY, rec.accelZ
 local sp2=rvx*rvx+rvy*rvy+rvz*rvz
-if sp2<MIN_SP2 then
+if sp2<MIN_SP2 and not rec.isHoming then
 if rec.slowSince==0 then rec.slowSince=now end
 return end
 rec.slowSince=0
 local rx,ry,rz=rec.px-mx,rec.py-my,rec.pz-mz
-if -(rx*rvx+ry*rvy+rz*rvz)<=0 then return end
+if -(rx*rvx+ry*rvy+rz*rvz)<=0 and not rec.isHoming then return end
 local R=rec.hitR local R2=R*R local hh=Config.BodyHalfHeight
 local g=rec.gravity and -grav or 0
 local step=Config.SampleStep local horizon=Config.Horizon
-local hitT=nil local x0,y0,z0=rx,ry,rz local t0=0
+local hitT=nil 
+local t0=0
+local foundCollision = false
+local colT = 0
+-- 🎯 ШАГ 1: Грубый поиск (Coarse Pass)
 while t0<horizon do
 local t1=t0+step
-local x1=rx+rvx*t1 local z1=rz+rvz*t1
-local y1=ry+rvy*t1+0.5*g*t1*t1
-local ex,ey,ez=x1-x0,y1-y0,z1-z0
+-- Кинематика 2-го порядка: P = P0 + V*t + 0.5*A*t^2
+local x1=rx + rvx*t1 + 0.5*rax*t1*t1 
+local z1=rz + rvz*t1 + 0.5*raz*t1*t1
+local y1=ry + (rvy)*t1 + 0.5*(ray + g)*t1*t1
+local ex,ey,ez=x1-rx,y1-ry,z1-rz
 local l2=ex*ex+ey*ey+ez*ez local u=0
 if l2>1e-9 then
-u=-(x0*ex+y0*ey+z0*ez)/l2
-if u<0 then u=0 elseif u>1 then u=1 end end
-local qx,qy,qz=x0+ex*u,y0+ey*u,z0+ez*u
+u=-(rx*ex+ry*ey+rz*ez)/l2
+if u<0 then u=0 elseif u>1 then u=1 end
+end
+local qx,qy,qz=rx+ex*u,ry+ey*u,rz+ez*u
 local ay=math.abs(qy)-hh if ay<0 then ay=0 end
 local d2=qx*qx+qz*qz+ay*ay
 if d2<=R2 then
-local back=0
-if l2>1e-9 then back=math.sqrt(R2-d2)/(math.sqrt(l2)/step) end
-hitT=t0+u*step-back
-if hitT<0 then hitT=0 end
-break end
-x0,y0,z0=x1,y1,z1 t0=t1 end
+foundCollision = true
+colT = t1
+break 
+end
+t0=t1 
+end
+-- 🎯 ШАГ 2: Бинарный поиск (Binary Search)
+if foundCollision then
+local low = colT - step
+local high = colT
+for _ = 1, 6 do
+local mid = (low + high) / 2
+local xm = rx + rvx*mid + 0.5*rax*mid*mid
+local zm = rz + rvz*mid + 0.5*raz*mid*mid
+local ym = ry + rvy*mid + 0.5*(ray + g)*mid*mid
+local ex,ey,ez=xm-rx,ym-ry,zm-rz
+local l2=ex*ex+ey*ey+ez*ez local u=0
+if l2>1e-9 then
+u=-(rx*ex+ry*ey+rz*ez)/l2
+if u<0 then u=0 elseif u>1 then u=1 end
+end
+local qx,qy,qz=rx+ex*u,ry+ey*u,rz+ez*u
+local ay=math.abs(qy)-hh if ay<0 then ay=0 end
+local d2=qx*qx+qz*qz+ay*ay
+if d2 <= R2 then high = mid else low = mid end
+end
+hitT = high
+end
 if hitT==nil then return end
 dangerUntil=now+0.4
 local adj=hitT+Config.PingSign*pingSec
 if adj<0 or hitT<=0.001 then adj=0 end
 rec.baseTti=hitT rec.tti=adj
+if rec.isHoming then rec.tti = rec.tti * 0.85 end
 local hs2=rvx*rvx+rvz*rvz
 if hs2>=4 then
 local hs=math.sqrt(hs2) rec.dirx,rec.dirz,rec.hasDir=rvx/hs,rvz/hs,true
@@ -365,7 +435,7 @@ if u>=1 then return D end
 return D*1.5*(u-u*u*u/3) end
 local function projClearance(rec,cx,cz,D,dur,delay,mx,my,mz,grav)
 local rx,ry,rz=rec.px-mx,rec.py-my,rec.pz-mz
-local vx,vy,vz=rec.vx,rec.vy,rec.vz
+local vx,vy,vz=rec.smoothVx,rec.smoothVy,rec.smoothVz -- Use smoothed for clearance too
 local g=rec.gravity and -grav or 0
 local tEnd=math.min(rec.baseTti+0.3,Config.Horizon+0.3)
 local step=Config.SampleStep local hh=Config.BodyHalfHeight
@@ -413,6 +483,49 @@ local down=-AXIS_Y*Config.VoidCheckDepth
 if not Workspace:Raycast(origin+dir*(free*0.5),down,c.rayParams) then return nil,"void" end
 if not Workspace:Raycast(origin+dir*free,down,c.rayParams) then return nil,"void" end
 return free,nil end
+
+-- 🧱 TACTICAL FLOW: Умные укрытия (LOS Break)
+local function findTacticalCover(mx, mz, threatX, threatZ, threatKind)
+    local bestScore = -math.huge
+    local bestDirX, bestDirZ = 0, 0
+    local toUsX = mx - threatX
+    local toUsZ = mz - threatZ
+    local distToThreat = math.sqrt(toUsX*toUsX + toUsZ*toUsZ)
+    if distToThreat < 0.1 then return 0,0,-1 end
+    
+    for i=1, N_DIR do
+        local cx, cz = baseCos[i], baseSin[i]
+        local clear = rayClear[i]
+        local void = rayVoid[i]
+        if not void and clear < 0.85 and clear > 0.1 then 
+            local wallDist = clear * RAY_LEN * 0.8
+            local wallX = mx + cx * wallDist
+            local wallZ = mz + cz * wallDist
+            local toWallX = wallX - threatX
+            local toWallZ = wallZ - threatZ
+            local distToWall = math.sqrt(toWallX*toWallX + toWallZ*toWallZ)
+            local dot = (toWallX * toUsX + toWallZ * toUsZ) / (distToThreat * distToWall + 0.001)
+            if dot > 0.5 then 
+                local score = (1 - clear) * 10 
+                if threatKind == "Homing" then score = score + 20 end
+                if score > bestScore then
+                    bestScore = score
+                    local perpX = -toUsZ / distToThreat
+                    local perpZ = toUsX / distToThreat
+                    local slotL = slotOf(-perpX, -perpZ)
+                    local slotR = slotOf(perpX, perpZ)
+                    if rayClear[slotR] > rayClear[slotL] then
+                        bestDirX, bestDirZ = perpX, perpZ
+                    else
+                        bestDirX, bestDirZ = -perpX, -perpZ
+                    end
+                end
+            end
+        end
+    end
+    return bestDirX, bestDirZ, bestScore
+end
+
 local function decide(now)
 local c=ctx local p=c.hrp.Position
 local mx,my,mz=p.X,p.Y,p.Z
@@ -420,6 +533,23 @@ local delay=pingMs/2000 local grav=Workspace.Gravity
 local look=c.hrp.CFrame.LookVector
 local hh=Config.BodyHalfHeight local D=Config.DashDistance
 local urgentMin=math.huge candN=0
+
+-- 🚀 TACTICAL COVER CHECK
+local isHomingThreat = false
+local threatX, threatZ = 0, 0
+for i=1, activeN do
+    local rec = active[i]
+    if rec.isHoming or (rec.kind == "Proj" and rec.tti < 0.35 and rec.baseTti > 0.1) then
+        isHomingThreat = true
+        threatX, threatZ = rec.px, rec.pz
+        break
+    end
+end
+if isHomingThreat then
+    local coverX, coverZ, score = findTacticalCover(mx, mz, threatX, threatZ, "Homing")
+    if score > 8 then addCand(coverX, coverZ, -15.0) end
+end
+
 for i=1,12 do addCand(baseCos[i],baseSin[i],0) end
 for i=1,activeN do
 local rec=active[i] local kind=rec.kind
@@ -606,6 +736,17 @@ if d<0.05 then d=0.05 end
 e.dist=d e.ox,e.oz=dx/d,dz/d
 e.face=e.lx*e.ox+e.lz*e.oz
 e.closing=e.vx*e.ox+e.vz*e.oz
+
+-- 🎯 AIM-SNAPPING DETECTION (Превентивные финты)
+if e.face > 0.85 and e.dist < 40 then
+    Ctl.orbitDir = (rng:NextNumber() < 0.5) and 1 or -1
+    if rng:NextNumber() < 0.05 then
+        Ctl.feintPhase = 1
+        Ctl.feintUntil = now + 0.2
+        Ctl.feintSide = Ctl.orbitDir
+    end
+end
+
 if d<=far then
 if polled<3 then polled+=1 pollEnemyAttack(e,now) end
 else e.attackActive=false end end end end
@@ -900,27 +1041,48 @@ if controlsObj then
 local mv=controlsObj:GetMoveVector()
 return mv.X*mv.X+mv.Z*mv.Z>0.09 end
 return false end
+
+-- 🏃 WEIGHT SHIFTING: Физика тела и инерция
 local function applyMove(dt)
-if not Ctl.active then return end
-local hum=ctx.hum
-if not hum or hum.Parent==nil then return end
-if Config.ManualOverride and not Config.NpcModel and readManual() then return end
-local ws=Ctl.wantSpeed
-local s=Ctl.speed local h=Ctl.heading local tgt=0
-if ws>0.02 then
-local dhFull=(math.atan2(Ctl.wantZ,Ctl.wantX)-h+math.pi)%TAU-math.pi
-local dh=dhFull
-if s<0.12 then h=h+dh
-else
-local maxStep=Ctl.wantTurn*DEG*dt
-if dh>maxStep then dh=maxStep elseif dh<-maxStep then dh=-maxStep end
-h=h+dh end
-tgt=ws*(1-0.35*math.min(1,math.abs(dhFull)/math.pi)) end
-if tgt>s then s=math.min(tgt,s+Config.SpeedAccel*dt)
-else s=math.max(tgt,s-Config.SpeedDecel*dt) end
-h=(h+math.pi)%TAU-math.pi
-Ctl.heading,Ctl.speed=h,s
-hum:Move(AXIS_X*(math.cos(h)*s)+AXIS_Z*(math.sin(h)*s),false) end
+    local now = os.clock()
+    if not Ctl.active then return end
+    local c=ctx local hum=c.hum
+    if not hum or hum.Parent==nil then return end
+    if Config.ManualOverride and not Config.NpcModel and readManual() then return end
+    
+    local wantSpeed = Ctl.wantSpeed
+    local wantH = Ctl.heading
+    local targetVx = math.cos(wantH) * wantSpeed
+    local targetVz = math.sin(wantH) * wantSpeed
+    
+    local currentSpeed = math.sqrt(c.velX*c.velX + c.velZ*c.velZ)
+    local dot = 1
+    if currentSpeed > 0.1 and wantSpeed > 0.1 then
+        dot = (targetVx * c.velX + targetVz * c.velZ) / (currentSpeed * wantSpeed + 0.001)
+    end
+    
+    local turnPenalty = math.max(0, -dot) * Config.LateralFriction
+    local effectiveAccel = Config.SpeedAccel * (1 + turnPenalty)
+    if currentSpeed < 0.5 and wantSpeed > 2 then
+        effectiveAccel = effectiveAccel * Config.BurstAccelMultiplier
+    end
+    
+    local lerpFactor = 1 - math.exp(-effectiveAccel * dt)
+    c.velX = c.velX + (targetVx - c.velX) * lerpFactor
+    c.velZ = c.velZ + (targetVz - c.velZ) * lerpFactor
+    
+    local moveMultiplier = 1.0
+    if c.hum.FloorMaterial ~= Enum.Material.Air then
+        if (Ctl.mvKind == MV_MELEE or Ctl.mvKind == MV_DODGE) and Ctl.mvActive then
+            if now - c.lastHesitation > 0.5 then c.lastHesitation = now end
+            if now - c.lastHesitation < Config.HesitationWindow then moveMultiplier = 0.4 end
+        end
+    end
+    
+    local moveDir = Vector3.new(c.velX * moveMultiplier, 0, c.velZ * moveMultiplier)
+    hum:Move(moveDir, false)
+end
+
 local function updateState(now)
 local new
 if not Enabled then new="Disabled"
