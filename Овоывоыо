@@ -1,6 +1,7 @@
---[[ HUMANLIKE AUTO-MANS v3.3-PORTABLE | LocalScript: StarterPlayer>StarterPlayerScripts
+--[[ HUMANLIKE AUTO-MANS v3.4-PORTABLE | LocalScript: StarterPlayer>StarterPlayerScripts
 РЕЖИМЫ (кнопка MODE или атрибут AutoEvasionMode): SURVIVE=убегает и выживает, COMBAT=не убегает, кружит и уворачивается.
-АВТО-БЕГА НЕТ: без угроз/врагов стоит. ПОРТИРУЕМОСТЬ: GuardIgnore, MeleeFallbackByApproach, DashWatchdog, ReasonAttribute, hum.RootPart.
+АВТО-БЕГА НЕТ: без угроз/врагов стоит. ПОРТИРУЕМОСТЬ: GuardIgnore, MeleeFallbackByApproach, DashWatchdog,
+ReasonAttribute, hum.RootPart, DashSpeedCap (анти-кик), ForceAllPlayersAsEnemies, AutoEvasionNetOwner.
 Пресеты: шутер MinRelSpeed=6,Horizon=1.8 | мечи EnemyAttackRange=11 | обби MinRelSpeed=8,MaxThreatSize=150,FreshStaticZones=true ]]
 local Players=game:GetService("Players") local RunService=game:GetService("RunService")
 local Stats=game:GetService("Stats") local TweenService=game:GetService("TweenService")
@@ -18,6 +19,7 @@ MeleeDashDistance=10, EvadeSideRandom=0.2, CounterWindow=0.7, OnCounterWindow=ni
 FeintChancePerSec=0.45, FlankEnabled=true, EscapeRange=36, EscapeDashRange=6, EscapeGoal=nil, FaceEnemy=true,
 GuardIgnore={Rooted=false,Anchored=false,Seated=false},
 MeleeFallbackByApproach=true, MeleeApproachSpeed=10, DashWatchdog=true, ReasonAttribute=true,
+DashSpeedCap=0, ForceAllPlayersAsEnemies=false,
 ScanRadius=80, MaxScanParts=1200, CalmScanEvery=2, DangerScanEvery=1, DangerTTI=0.9,
 MinRelSpeed=28, MaxThreatSize=24, MaxProjectileRadius=6, IgnoreOtherCharacters=false, SlowPruneSeconds=0.4,
 Horizon=1.4, SampleStep=0.04, TriggerLead=0.5, BodyRadius=2.4, BodyHalfHeight=2.6, HitMargin=1.2,
@@ -116,7 +118,10 @@ local function startDash(now,dx,dz,dist)
 local c=ctx
 if not c.lv or not c.lv.Parent then return false end
 local dur=math.max(Config.DashDuration,dist/Config.DashAvgSpeed)
-c.dashDur=dur c.dashDir=AXIS_X*dx+AXIS_Z*dz c.dashPeak=1.5*dist/dur
+c.dashDur=dur c.dashDir=AXIS_X*dx+AXIS_Z*dz
+local peak=1.5*dist/dur
+if Config.DashSpeedCap>0 and peak>Config.DashSpeedCap then peak=Config.DashSpeedCap end
+c.dashPeak=peak
 c.dashStart=now c.dashing=true c.cooldownEnd=now+Config.DashCooldown
 c.lastDirX,c.lastDirZ,c.lastDirTime=dx,dz,now
 c.lv.VectorVelocity=c.dashDir*c.dashPeak c.lv.Enabled=true
@@ -509,7 +514,8 @@ local ok,r=pcall(Config.IsEnemy,model,plr)
 if ok then return r and true or false end end
 if plr then
 if plr==LocalPlayer then return false end
-if not Config.IncludeTeammates and LocalPlayer.Team~=nil and plr.Team==LocalPlayer.Team then return false end end
+if not Config.ForceAllPlayersAsEnemies and not Config.IncludeTeammates
+and LocalPlayer.Team~=nil and plr.Team==LocalPlayer.Team then return false end end
 return true end
 local function addEnemy(model,plr)
 local hum=model:FindFirstChildOfClass("Humanoid")
@@ -999,6 +1005,12 @@ endDash() clearThreats() cachedReason="Dead" setControl(false) end)
 c.conns[#c.conns+1]=char.AncestryChanged:Connect(function()
 if not char:IsDescendantOf(game) and ctx.char==char then teardownCharacter() end end)
 cachedReason=nil pingAcc=1 Ctl.nextEnemyRefresh=0
+task.defer(function()
+if hrp and hrp.Parent then
+local owner=hrp:GetNetworkOwner()
+LocalPlayer:SetAttribute("AutoEvasionNetOwner",owner==LocalPlayer and "Client" or (owner==nil and "Server" or "Other"))
+end
+end)
 dbg("target ready") end
 local function setEnabled(v)
 if Enabled==v then return end
