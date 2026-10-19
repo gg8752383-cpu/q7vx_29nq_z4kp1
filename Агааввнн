@@ -1,0 +1,1628 @@
+--[[ ASSISTANT-MANS v7.0-FINAL | LocalScript: StarterPlayer>StarterPlayerScripts
+УНИВЕРСАЛЬНЫЙ ассистент уклонения. Работает в ЛЮБОЙ игре, на ЛЮБОМ языке.
+v7.0: полная адаптация к скорости, экстренный буст +3, плавный дэш, мониторинг состояния,
+не зависит от локализации, работает через Humanoid:Move() или BodyVelocity.
+]]
+local Players=game:GetService("Players")
+local RunService=game:GetService("RunService")
+local Stats=game:GetService("Stats")
+local TweenService=game:GetService("TweenService")
+local UserInputService=game:GetService("UserInputService")
+local Workspace=game:GetService("Workspace")
+local LocalPlayer=Players.LocalPlayer
+
+local AXIS_X,AXIS_Y,AXIS_Z=Vector3.xAxis,Vector3.yAxis,Vector3.zAxis
+local TAU=math.pi*2
+local DEG=math.pi/180
+
+-- ===================== КОНФИГУРАЦИЯ =====================
+local Config={
+    StartEnabled=true, Debug=false, NpcModel=nil,
+    ReactionMinMs=70, ReactionMaxMs=160, BrainHz=30,
+    SpeedAccel=6, SpeedDecel=9,
+    TurnRateNormal=500, TurnRateEmergency=1000,
+    ScanRadius=70, MaxScanParts=800,
+    MinRelSpeed=10, MaxThreatSize=40, MaxProjectileRadius=6,
+    SlowPruneSeconds=0.5,
+    Horizon=1.5, SampleStep=0.04,
+    BodyRadius=2.2, BodyHalfHeight=2.5, HitMargin=1.2,
+    -- Дэш: адаптивный
+    DashDistance=14, DashMaxDistance=28, DashMinDistance=5,
+    DashCooldown=0.95, DashForce=1e7,
+    PostDashSettle=0.15, WallPadding=1.5, VoidCheckDepth=45,
+    -- СКОРОСТЬ: авто-детект и адаптация
+    SpeedMultiplier=4.0, -- DashSpeed = WalkSpeed * SpeedMultiplier
+    BoostAmount=3, -- +3 к WalkSpeed при дэше
+    BoostDuration=0.5, -- длительность буста
+    MinWalkSpeed=1, -- минимальная WalkSpeed для работы
+    WalkDodge=true, WalkDodgeTTI=0.45,
+    ReactiveJump=true,
+    PingSign=-1, PingMaxMs=600,
+    TriggerThreshold=0.6,
+    HistoryWindow=1.3, HistoryPenalty=1.0,
+    MomentumBonus=0.6, MomentumPenalty=0.8,
+    MultiThreatPenalty=1.5,
+    CoverBonus=0.9, CoverRayLen=7,
+    NDir=24,
+    StateMonitorInterval=0.25,
+}
+
+-- ===================== СОСТОЯНИЕ =====================
+local rng=Random.new()
+local Enabled=Config.StartEnabled
+local pingMs=0
+local cachedReason=nil
+local MIN_SP2=Config.MinRelSpeed*Config.MinRelSpeed
+
+-- Динамические параметры (обновляются автоматически)
+local Dyn={
+    baseWalkSpeed=16,
+    dashSpeed=64,
+    canMove=true,
+    isNetworkOwner=true,
+    rigType="R6",
+    moveMethod="hum", -- hum/bodyvelocity/assembly
+}
+
+local ctx={
+    char=nil,hum=nil,hrp=nil,lv=nil,att=nil,bv=nil,
+    rayParams=nil,coverRay=nil,overlapParams=nil,conns={},
+    dashing=false,dashStart=0,dashDur=0,dashDir=Vector3.zero,dashPeak=0,
+    cooldownEnd=0,settleUntil=0,
+    nextJumpAt=0,
+    boosting=false,boostEnd=0,originalWalkSpeed=16,
+    stateMonAcc=0,
+}
+
+local Ctl={
+    active=false,heading=0,speed=0,
+    wantX=0,wantZ=0,wantSpeed=0,wantTurn=500,
+    mvActive=false,mvX=0,mvZ=0,mvUntil=0,
+    pendingDodgeAt=0,noDelayUntil=0,
+    lastDodgeDirX=0,lastDodgeDirZ=0,lastDodgeAt=-10,
+}
+
+local threats={}
+local pool={}
+local watch=setmetatable({},{__mode="k"})
+local bornAt=setmetatable({},{__mode="k"})
+local scanAcc=0
+local dangerUntil=0
+local active={}
+local activeN=0
+local candX,candZ,candScore,candUsed={},{},{},{}
+local candN=0
+local N_DIR=Config.NDir
+local baseCos,baseSin={},{}
+for i=0,N_DIR-1 do
+    local a=i*(TAU/N_DIR)
+    baseCos[i+1]=math.cos(a)
+    baseSin[i+1]=math.sin(a)
+end
+
+local MOVER_CLASSES={"BodyVelocity","BodyForce","BodyPosition","BodyThrust","LinearVelocity","VectorForce","AlignPosition"}
+local BAD_STATES={
+    [Enum.HumanoidStateType.Dead]=true,
+    [Enum.HumanoidStateType.Ragdoll]=true,
+    [Enum.HumanoidStateType.FallingDown]=true,
+    [Enum.HumanoidStateType.Physics]=true,
+    [Enum.HumanoidStateType.PlatformStanding]=true,
+    [Enum.HumanoidStateType.Seated]=true,
+}
+
+local function dbg(...) if Config.Debug then print("[AssistMans]",...) end end
+
+local function hasMover(p)
+    for i=1,#MOVER_CLASSES do
+        if p:FindFirstChildWhichIsA(MOVER_CLASSES[i]) then return true end
+    end
+    return false
+end
+
+local function getTarget() return Config.NpcModel or LocalPlayer.Character end
+
+local function smoothstep(t)
+    if t<=0 then return 0 end
+    if t>=1 then return 1 end
+    return t*t*(3-2*t)
+end
+
+local function dashPos(el,dur,D) return D*smoothstep(el/dur) end
+
+-- ===================== АВТО-ДЕТЕКТ =====================
+local function detectSpeed()
+    local hum=ctx.hum
+    if not hum then return end
+    local ok,ws=pcall(function() return hum.WalkSpeed end)
+    if ok and type(ws)=="number" and ws>0 and ws<200 then
+        Dyn.baseWalkSpeed=ws
+        Dyn.dashSpeed=ws*Config.SpeedMultiplier
+        dbg("speed detected:",ws,"dash:",Dyn.dashSpeed)
+    end
+end
+
+local function detectRig()
+    local char=ctx.char
+    if not char then return end
+    if char:FindFirstChild("LowerTorso") or char:FindFirstChild("UpperTorso") then
+        Dyn.rigType="R15"
+    elseif char:FindFirstChild("Torso") then
+        Dyn.rigType="R6"
+    else
+        Dyn.rigType="Custom"
+    end
+    dbg("rig:",Dyn.rigType)
+end
+
+local function detectNetworkOwner()
+    local hrp=ctx.hrp
+    if not hrp then
+        Dyn.isNetworkOwner=true
+        return
+    end
+    local ok,owner=pcall(function() return hrp:GetNetworkOwner() end)
+    if ok then
+        Dyn.isNetworkOwner=(owner==LocalPlayer or owner==nil)
+    else
+        Dyn.isNetworkOwner=true
+    end
+    dbg("network owner:",Dyn.isNetworkOwner and "client" or "server")
+end
+
+local function detectMoveMethod()
+    local hum=ctx.hum
+    local hrp=ctx.hrp
+    if not hum or not hrp then
+        Dyn.moveMethod="none"
+        Dyn.canMove=false
+        return
+    end
+    -- Пробуем hum:Move()
+    local ok=pcall(function()
+        if typeof(hum.Move)=="function" then
+            hum:Move(Vector3.zero,false)
+        else
+            error("no move")
+        end
+    end)
+    if ok then
+        Dyn.moveMethod="hum"
+        Dyn.canMove=true
+        return
+    end
+    -- Fallback: AssemblyLinearVelocity
+    local ok2=pcall(function()
+        local v=hrp.AssemblyLinearVelocity
+        hrp.AssemblyLinearVelocity=v
+    end)
+    if ok2 then
+        Dyn.moveMethod="assembly"
+        Dyn.canMove=true
+        return
+    end
+    Dyn.moveMethod="none"
+    Dyn.canMove=false
+    dbg("move method:",Dyn.moveMethod)
+end
+
+-- ===================== БУСТ СКОРОСТИ (+3) =====================
+local function startBoost()
+    if not ctx.hum or ctx.boosting then return end
+    local ok=pcall(function()
+        local cur=ctx.hum.WalkSpeed
+        if cur>0 and cur<200 then
+            ctx.originalWalkSpeed=cur
+            ctx.hum.WalkSpeed=cur+Config.BoostAmount
+            ctx.boosting=true
+            ctx.boostEnd=os.clock()+Config.BoostDuration
+        end
+    end)
+end
+
+local function endBoost()
+    if not ctx.hum or not ctx.boosting then return end
+    pcall(function()
+        ctx.hum.WalkSpeed=ctx.originalWalkSpeed
+        ctx.boosting=false
+    end)
+end
+
+local function checkBoost()
+    if ctx.boosting and os.clock()>=ctx.boostEnd then
+        endBoost()
+    end
+end
+
+-- ===================== МОНИТОРИНГ СОСТОЯНИЯ =====================
+local function monitorState(now)
+    if not ctx.hum or not ctx.char then
+        cachedReason="NoCharacter"
+        return
+    end
+    -- Health
+    local ok,hp=pcall(function() return ctx.hum.Health end)
+    if not ok or hp<=0 then
+        cachedReason="Dead"
+        return
+    end
+    -- State
+    local ok2,state=pcall(function() return ctx.hum:GetState() end)
+    if ok2 and BAD_STATES[state] then
+        cachedReason="BadState"
+        return
+    end
+    -- WalkSpeed (stun/freeze)
+    local ok3,ws=pcall(function() return ctx.hum.WalkSpeed end)
+    if ok3 and ws<Config.MinWalkSpeed then
+        cachedReason="Rooted"
+        return
+    end
+    -- Anchored
+    if ctx.hrp and ctx.hrp.Anchored then
+        cachedReason="Anchored"
+        return
+    end
+    -- Seated
+    local ok4,sit=pcall(function() return ctx.hum.Sit end)
+    if ok4 and sit then
+        cachedReason="Seated"
+        return
+    end
+    -- PlatformStand
+    local ok5,ps=pcall(function() return ctx.hum.PlatformStand end)
+    if ok5 and ps then
+        cachedReason="Platform"
+        return
+    end
+    -- Ragdoll constraints
+    local bs=ctx.char:FindFirstChildWhichIsA("BallSocketConstraint",true)
+    if bs then
+        local ok6,en=pcall(function() return bs.Enabled end)
+        if ok6 and en then
+            cachedReason="Ragdoll"
+            return
+        end
+    end
+    -- Пересчитываем скорость если изменилась
+    if ok3 and math.abs(ws-Dyn.baseWalkSpeed)>1.0 and not ctx.boosting then
+        Dyn.baseWalkSpeed=ws
+        Dyn.dashSpeed=ws*Config.SpeedMultiplier
+    end
+    if cachedReason then cachedReason=nil end
+end
+
+-- ===================== GUARD REASON =====================
+local function guardReason()
+    local c,h,hrp=ctx.char,ctx.hum,ctx.hrp
+    if not c or c.Parent==nil or not h or h.Parent==nil or not hrp or hrp.Parent==nil then return "NoCharacter" end
+    if not Dyn.canMove then return "NoMoveMethod" end
+    if not Dyn.isNetworkOwner then return "ServerChar" end
+    return cachedReason
+end
+
+local function updatePing()
+    local ok,v=pcall(function() return Stats.Network.ServerStatsItem["Data Ping"]:GetValue() end)
+    if ok and type(v)=="number" then
+        v=math.clamp(v,0,Config.PingMaxMs)
+        if pingMs==0 then pingMs=v else pingMs=pingMs*0.5+v*0.5 end
+    end
+end
+
+local function startManeuver(now,dx,dz,duration)
+    local m=math.sqrt(dx*dx+dz*dz)
+    if m<1e-4 then return end
+    Ctl.mvActive=true
+    Ctl.mvX,Ctl.mvZ=dx/m,dz/m
+    Ctl.mvUntil=now+duration
+end
+
+local function endDash()
+    local c=ctx
+    if c.lv then
+        pcall(function()
+            c.lv.VectorVelocity=Vector3.zero
+            c.lv.Enabled=false
+        end)
+    end
+    if c.bv then
+        pcall(function() c.bv:Destroy() end)
+        c.bv=nil
+    end
+    if c.dashing then
+        c.settleUntil=os.clock()+Config.PostDashSettle
+        endBoost()
+    end
+    c.dashing=false
+end
+
+local function startDash(now,dx,dz,dist)
+    local c=ctx
+    local hrp=c.hrp
+    if not hrp or not hrp.Parent then return false end
+    
+    -- Используем адаптивную скорость
+    local dashSpeed=Dyn.dashSpeed
+    if dashSpeed<10 then dashSpeed=60 end
+    
+    local dur=math.max(0.25,dist/dashSpeed)
+    c.dashDur=dur
+    c.dashDir=AXIS_X*dx+AXIS_Z*dz
+    c.dashPeak=dist/dur
+    c.dashStart=now
+    c.dashing=true
+    c.cooldownEnd=now+Config.DashCooldown
+    
+    -- Буст скорости +3
+    startBoost()
+    
+    -- Пробуем LinearVelocity
+    if c.lv and c.lv.Parent then
+        local ok=pcall(function()
+            c.lv.VectorVelocity=c.dashDir*c.dashPeak
+            c.lv.Enabled=true
+        end)
+        if ok then
+            startManeuver(now,dx,dz,dur+0.2)
+            Ctl.lastDodgeDirX,Ctl.lastDodgeDirZ,Ctl.lastDodgeAt=dx,dz,now
+            dbg("dash (LV)",dx,dz,dist,dur,"speed:",dashSpeed)
+            return true
+        end
+    end
+    
+    -- Fallback: BodyVelocity
+    local ok2=pcall(function()
+        local bv=Instance.new("BodyVelocity")
+        bv.MaxForce=Vector3.new(Config.DashForce,0,Config.DashForce)
+        bv.Velocity=c.dashDir*c.dashPeak
+        bv.P=5000
+        bv.Parent=hrp
+        c.bv=bv
+    end)
+    if ok2 then
+        startManeuver(now,dx,dz,dur+0.2)
+        Ctl.lastDodgeDirX,Ctl.lastDodgeDirZ,Ctl.lastDodgeAt=dx,dz,now
+        dbg("dash (BV)",dx,dz,dist,dur,"speed:",dashSpeed)
+        return true
+    end
+    
+    c.dashing=false
+    return false
+end
+
+local function startWalkDodge(now,dx,dz,duration)
+    startManeuver(now,dx,dz,duration)
+    Ctl.lastDodgeDirX,Ctl.lastDodgeDirZ,Ctl.lastDodgeAt=dx,dz,now
+end
+
+local function releaseRecord(rec) rec.part=nil pool[#pool+1]=rec end
+
+local function newRecord(part,kind,now,px,py,pz,vx,vy,vz,m,growth)
+    local rec=pool[#pool]
+    if rec then pool[#pool]=nil else rec={} end
+    rec.part=part; rec.kind=kind
+    rec.firstSeen=now; rec.lastSeen=now; rec.t=now
+    rec.px,rec.py,rec.pz=px,py,pz
+    rec.vx,rec.vy,rec.vz=vx,vy,vz
+    rec.s=m; rec.growth=growth or 0
+    rec.anchored=part.Anchored; rec.samples=0
+    rec.tti,rec.baseTti=math.huge,math.huge
+    rec.urgent=false; rec.handledUntil=0
+    rec.dirx,rec.dirz,rec.hasDir=0,0,false
+    rec.slowSince=0; rec.activeUntil=math.huge
+    rec.gravity=false; rec.accY=0
+    rec.hitR,rec.radius,rec.safeR,rec.halfY=0,0,0,0
+    rec.ox,rec.oy,rec.oz,rec.ax,rec.ay,rec.az,rec.blen,rec.lim=0,0,0,0,0,0,0,0
+    if kind=="Proj" then
+        rec.radius=math.min(m*0.5,Config.MaxProjectileRadius)
+        rec.hitR=rec.radius+Config.BodyRadius+Config.HitMargin
+        rec.gravity=(not rec.anchored) and not hasMover(part)
+        rec.accY=rec.gravity and -Workspace.Gravity or 0
+    elseif kind=="AOE" then
+        rec.radius=math.min(m*0.5,60)
+        rec.halfY=rec.radius
+        rec.safeR=rec.radius+Config.BodyRadius+Config.HitMargin
+        rec.activeUntil=now+1.5
+    else
+        rec.activeUntil=now+0.6
+    end
+    return rec
+end
+
+local function clearThreats()
+    for p,r in pairs(threats) do threats[p]=nil releaseRecord(r) end
+    activeN=0
+end
+
+local function updateRecord(rec,now)
+    local ok,part=pcall(function() return rec.part end)
+    if not ok or not part or not part.Parent then return end
+    local ok2,p=pcall(function() return part.Position end)
+    if not ok2 then return end
+    local px,py,pz=p.X,p.Y,p.Z
+    local dt=now-rec.t
+    if rec.kind=="Proj" then
+        local vx,vy,vz
+        local anch=false
+        pcall(function() anch=part.Anchored end)
+        rec.anchored=anch
+        if anch then
+            if dt>0.004 then
+                vx=rec.vx*0.4+((px-rec.px)/dt)*0.6
+                vy=rec.vy*0.4+((py-rec.py)/dt)*0.6
+                vz=rec.vz*0.4+((pz-rec.pz)/dt)*0.6
+            else vx,vy,vz=rec.vx,rec.vy,rec.vz end
+            rec.gravity=false
+        else
+            local ok3,v=pcall(function() return part.AssemblyLinearVelocity end)
+            if ok3 then
+                vx,vy,vz=v.X,v.Y,v.Z
+                if dt>0.01 then
+                    rec.accY=rec.accY*0.7+((vy-rec.vy)/dt)*0.3
+                    rec.samples=rec.samples+1
+                    if rec.samples>=4 then
+                        rec.gravity=rec.accY<-0.5*Workspace.Gravity
+                    end
+                end
+            else
+                vx,vy,vz=rec.vx,rec.vy,rec.vz
+            end
+        end
+        rec.vx,rec.vy,rec.vz=vx,vy,vz
+        rec.t=now
+    else
+        local ok3,s=pcall(function() return part.Size end)
+        if not ok3 then return end
+        local m=math.max(s.X,s.Y,s.Z)
+        if dt>0.004 then
+            local gr=(m-rec.s)/dt
+            rec.growth=rec.growth*0.6+gr*0.4
+            if gr>=6 then
+                local untilT=now+(rec.kind=="AOE" and 1.5 or 0.6)
+                if untilT>rec.activeUntil then rec.activeUntil=untilT end
+            end
+            rec.s=m; rec.t=now
+        end
+    end
+    rec.px,rec.py,rec.pz=px,py,pz
+    rec.lastSeen=now
+end
+
+local function acceptZone(part,myRoot)
+    local ok,root=pcall(function() return part.AssemblyRootPart end)
+    if ok and root==myRoot then return false end
+    return true
+end
+
+local function acceptProj(part,m,myRoot)
+    if m>Config.MaxThreatSize then return false end
+    return acceptZone(part,myRoot)
+end
+
+local function zoneKind(s,m)
+    local a,b,c3=s.X,s.Y,s.Z
+    local mn=math.min(a,b,c3)
+    local mid=a+b+c3-m-mn
+    if m/math.max(mid,0.05)>=4 and mid<=7 then return "Beam" end
+    return "AOE"
+end
+
+local function tryFresh(part,s,m,now,px,py,pz,myRoot)
+    local ok,cc=pcall(function() return part.CanCollide end)
+    if ok and cc then return end
+    if not acceptZone(part,myRoot) then return end
+    local kind=zoneKind(s,m)
+    if kind=="Beam" and m>=4 then
+        watch[part]=nil
+        threats[part]=newRecord(part,"Beam",now,px,py,pz,0,0,0,m,0)
+    elseif m>=4 and m<=120 then
+        watch[part]=nil
+        threats[part]=newRecord(part,"AOE",now,px,py,pz,0,0,0,m,0)
+    end
+end
+
+local scanIdx=0
+local stagger=0
+
+local function scheduleWatch(w)
+    if w.n<4 then w.n=w.n+1; w.next=scanIdx+1
+    else stagger=(stagger+1)%3; w.next=scanIdx+3+stagger end
+end
+
+local function observePart(part,w,now,mvx,mvy,mvz,myRoot)
+    local ok,anch=pcall(function() return part.Anchored end)
+    if not ok then return end
+    if anch then
+        local p=part.Position
+        local px,py,pz=p.X,p.Y,p.Z
+        local s=part.Size
+        local m=math.max(s.X,s.Y,s.Z)
+        if not w then
+            w={x=px,y=py,z=pz,t=now,s=m,n=0,next=0}
+            watch[part]=w
+            scheduleWatch(w)
+            local born=bornAt[part]
+            if born and now-born<=0.3 then tryFresh(part,s,m,now,px,py,pz,myRoot) end
+            return
+        end
+        local dt=now-w.t
+        if dt>0.25 then
+            w.x,w.y,w.z,w.t,w.s=px,py,pz,now,m
+            w.n=0; scheduleWatch(w); return
+        end
+        if dt<=0.004 then return end
+        local vx,vy,vz=(px-w.x)/dt,(py-w.y)/dt,(pz-w.z)/dt
+        local dm=m-w.s
+        local growth=dm/dt
+        w.x,w.y,w.z,w.t,w.s=px,py,pz,now,m
+        local rvx,rvy,rvz=vx-mvx,vy-mvy,vz-mvz
+        if rvx*rvx+rvy*rvy+rvz*rvz>=MIN_SP2 then
+            if acceptProj(part,m,myRoot) then
+                watch[part]=nil
+                threats[part]=newRecord(part,"Proj",now,px,py,pz,vx,vy,vz,m,0)
+                return
+            end
+        elseif growth>=6 and dm>=0.2 then
+            if acceptZone(part,myRoot) then
+                watch[part]=nil
+                threats[part]=newRecord(part,zoneKind(s,m),now,px,py,pz,0,0,0,m,growth)
+                return
+            end
+        end
+        scheduleWatch(w)
+    else
+        if w then watch[part]=nil end
+        local ok2,v=pcall(function() return part.AssemblyLinearVelocity end)
+        if not ok2 then return end
+        local vx,vy,vz=v.X,v.Y,v.Z
+        local rvx,rvy,rvz=vx-mvx,vy-mvy,vz-mvz
+        if rvx*rvx+rvy*rvy+rvz*rvz>=MIN_SP2 then
+            local s=part.Size
+            local m=math.max(s.X,s.Y,s.Z)
+            if acceptProj(part,m,myRoot) then
+                local p=part.Position
+                threats[part]=newRecord(part,"Proj",now,p.X,p.Y,p.Z,vx,vy,vz,m,0)
+            end
+        end
+    end
+end
+
+local function prune(now)
+    local slowLimit=Config.SlowPruneSeconds
+    for p,r in pairs(threats) do
+        local dead=false
+        if r.lastSeen<now-0.2 then dead=true end
+        if not p or not p.Parent then dead=true end
+        if now>r.activeUntil then dead=true end
+        if r.slowSince>0 and now-r.slowSince>slowLimit then dead=true end
+        if dead then threats[p]=nil; releaseRecord(r) end
+    end
+end
+
+local function ScanForThreats(now)
+    scanIdx=scanIdx+1
+    local hrp=ctx.hrp
+    if not hrp or not hrp.Parent then return end
+    local ok1,hv=pcall(function() return hrp.AssemblyLinearVelocity end)
+    if not ok1 then return end
+    local mvx,mvy,mvz=hv.X,hv.Y,hv.Z
+    local ok2,myRoot=pcall(function() return hrp.AssemblyRootPart end)
+    if not ok2 then return end
+    local ok3,parts=pcall(function()
+        return Workspace:GetPartBoundsInRadius(hrp.Position,Config.ScanRadius,ctx.overlapParams)
+    end)
+    if not ok3 then return end
+    local terrain=Workspace.Terrain
+    for i=1,#parts do
+        local part=parts[i]
+        local rec=threats[part]
+        if rec then updateRecord(rec,now)
+        elseif part~=terrain then
+            local w=watch[part]
+            if not (w and w.next>scanIdx) then
+                observePart(part,w,now,mvx,mvy,mvz,myRoot)
+            end
+        end
+    end
+    prune(now)
+end
+
+local function pushActive(rec)
+    rec.urgent=true; activeN=activeN+1; active[activeN]=rec
+end
+
+local function segDist2(ox,oy,oz,dx,dy,dz,len,px,py,pz)
+    local rx,ry,rz=px-ox,py-oy,pz-oz
+    local t=rx*dx+ry*dy+rz*dz
+    if t<0 then t=0 elseif t>len then t=len end
+    local qx,qy,qz=rx-dx*t,ry-dy*t,rz-dz*t
+    return qx*qx+qy*qy+qz*qz
+end
+
+local function evalProj(rec,mx,my,mz,mvx,mvy,mvz,pingSec,grav,now)
+    local rvx,rvy,rvz=rec.vx-mvx,rec.vy-mvy,rec.vz-mvz
+    local sp2=rvx*rvx+rvy*rvy+rvz*rvz
+    if sp2<MIN_SP2 then
+        if rec.slowSince==0 then rec.slowSince=now end; return
+    end
+    rec.slowSince=0
+    local rx,ry,rz=rec.px-mx,rec.py-my,rec.pz-mz
+    if -(rx*rvx+ry*rvy+rz*rvz)<=0 then return end
+    local R=rec.hitR
+    local R2=R*R
+    local hh=Config.BodyHalfHeight
+    local g=rec.gravity and -grav or 0
+    local step=Config.SampleStep
+    local horizon=Config.Horizon
+    local hitT=nil
+    local x0,y0,z0=rx,ry,rz
+    local t0=0
+    while t0<horizon do
+        local t1=t0+step
+        local x1=rx+rvx*t1
+        local z1=rz+rvz*t1
+        local y1=ry+rvy*t1+0.5*g*t1*t1
+        local ex,ey,ez=x1-x0,y1-y0,z1-z0
+        local l2=ex*ex+ey*ey+ez*ez
+        local u=0
+        if l2>1e-9 then
+            u=-(x0*ex+y0*ey+z0*ez)/l2
+            if u<0 then u=0 elseif u>1 then u=1 end
+        end
+        local qx,qy,qz=x0+ex*u,y0+ey*u,z0+ez*u
+        local ay=math.abs(qy)-hh
+        if ay<0 then ay=0 end
+        local d2=qx*qx+qz*qz+ay*ay
+        if d2<=R2 then
+            local back=0
+            if l2>1e-9 then back=math.sqrt(R2-d2)/(math.sqrt(l2)/step) end
+            hitT=t0+u*step-back
+            if hitT<0 then hitT=0 end
+            break
+        end
+        x0,y0,z0=x1,y1,z1
+        t0=t1
+    end
+    if hitT==nil then return end
+    dangerUntil=now+0.4
+    local adj=hitT+Config.PingSign*pingSec
+    if adj<0 or hitT<=0.001 then adj=0 end
+    rec.baseTti=hitT; rec.tti=adj
+    local hs2=rvx*rvx+rvz*rvz
+    if hs2>=4 then
+        local hs=math.sqrt(hs2)
+        rec.dirx,rec.dirz,rec.hasDir=rvx/hs,rvz/hs,true
+    else rec.hasDir=false end
+    if adj<=Config.TriggerThreshold then pushActive(rec) end
+end
+
+local function evalAOE(rec,mx,my,mz,now)
+    local part=rec.part
+    local s=part.Size
+    local m=math.max(s.X,s.Y,s.Z)
+    local mn=math.min(s.X,s.Y,s.Z)
+    local radius=math.min(m*0.5,60)
+    local grow=rec.growth
+    if grow<0 then grow=0 end
+    local radP=radius+grow*0.4
+    rec.radius=radius
+    rec.safeR=radP+Config.BodyRadius+Config.HitMargin
+    if mn<0.35*m then rec.halfY=mn*0.5+1 else rec.halfY=radius end
+    local dx,dz=mx-rec.px,mz-rec.pz
+    local ay=math.abs(my-rec.py)-Config.BodyHalfHeight-rec.halfY
+    if ay<0 then ay=0 end
+    local dist=math.sqrt(dx*dx+dz*dz+ay*ay)
+    if dist>rec.safeR then return end
+    local tti=0
+    if grow>0.5 and dist<rec.safeR then
+        local needed=rec.safeR-dist
+        local growSec=grow*0.4
+        tti=math.max(0,needed/(grow+growSec))
+        if tti>1.5 then tti=0 end
+    end
+    rec.baseTti,rec.tti=tti,tti
+    dangerUntil=now+0.4
+    pushActive(rec)
+end
+
+local function beamGeometry(rec)
+    local part=rec.part
+    local s=part.Size
+    local cf=part.CFrame
+    local axis,len,w
+    if s.Z>=s.X and s.Z>=s.Y then axis,len,w=cf.LookVector,s.Z,math.max(s.X,s.Y)
+    elseif s.X>=s.Y then axis,len,w=cf.RightVector,s.X,math.max(s.Y,s.Z)
+    else axis,len,w=cf.UpVector,s.Y,math.max(s.X,s.Z) end
+    local ext=rec.growth
+    if ext<0 then ext=0 end
+    local L=len+ext*0.15
+    local c=cf.Position
+    local h=L*0.5
+    rec.ox,rec.oy,rec.oz=c.X-axis.X*h,c.Y-axis.Y*h,c.Z-axis.Z*h
+    rec.ax,rec.ay,rec.az=axis.X,axis.Y,axis.Z
+    rec.blen=L
+    rec.lim=w*0.5+Config.BodyHalfHeight*0.9+Config.HitMargin*0.5
+end
+
+local function evalBeam(rec,mx,my,mz,now)
+    beamGeometry(rec)
+    local d2=segDist2(rec.ox,rec.oy,rec.oz,rec.ax,rec.ay,rec.az,rec.blen,mx,my,mz)
+    if d2<=rec.lim*rec.lim then
+        rec.tti,rec.baseTti=0,0
+        dangerUntil=now+0.4
+        pushActive(rec)
+    end
+end
+
+local function evaluate(now)
+    activeN=0
+    local hrp=ctx.hrp
+    if not hrp or not hrp.Parent then return end
+    local ok1,p=pcall(function() return hrp.Position end)
+    local ok2,v=pcall(function() return hrp.AssemblyLinearVelocity end)
+    if not ok1 or not ok2 then return end
+    local mx,my,mz=p.X,p.Y,p.Z
+    local mvx,mvy,mvz=v.X,v.Y,v.Z
+    local pingSec=pingMs/1000
+    local grav=Workspace.Gravity
+    for _,rec in pairs(threats) do
+        rec.urgent=false
+        if now>=rec.handledUntil then
+            local ok3=pcall(function() return rec.part and rec.part.Parent end)
+            if ok3 then
+                if rec.kind=="Proj" then
+                    evalProj(rec,mx,my,mz,mvx,mvy,mvz,pingSec,grav,now)
+                elseif rec.kind=="AOE" then
+                    evalAOE(rec,mx,my,mz,now)
+                else
+                    evalBeam(rec,mx,my,mz,now)
+                end
+            end
+        end
+    end
+end
+
+local function addCand(x,z)
+    if candN>=N_DIR then return end
+    local m=math.sqrt(x*x+z*z)
+    if m<1e-4 then return end
+    candN=candN+1
+    candX[candN]=x/m; candZ[candN]=z/m
+    candScore[candN]=0; candUsed[candN]=false
+end
+
+local function projMinClearance(rec,cx,cz,D,dur,mx,my,mz,grav)
+    local rx,ry,rz=rec.px-mx,rec.py-my,rec.pz-mz
+    local vx,vy,vz=rec.vx,rec.vy,rec.vz
+    local g=rec.gravity and -grav or 0
+    local tEnd=math.min(rec.baseTti+0.3,Config.Horizon+0.3)
+    local step=Config.SampleStep
+    local hh=Config.BodyHalfHeight
+    local minD2=math.huge
+    local x0,y0,z0=rx,ry,rz
+    local t0=0
+    while t0<tEnd do
+        local t1=t0+step
+        local s1=dashPos(t1,dur,D)
+        local x1=rx+vx*t1-cx*s1
+        local z1=rz+vz*t1-cz*s1
+        local y1=ry+vy*t1+0.5*g*t1*t1
+        local ex,ey,ez=x1-x0,y1-y0,z1-z0
+        local l2=ex*ex+ey*ey+ez*ez
+        local u=0
+        if l2>1e-9 then
+            u=-(x0*ex+y0*ey+z0*ez)/l2
+            if u<0 then u=0 elseif u>1 then u=1 end
+        end
+        local qx,qy,qz=x0+ex*u,y0+ey*u,z0+ez*u
+        local ay=math.abs(qy)-hh
+        if ay<0 then ay=0 end
+        local d2=qx*qx+qz*qz+ay*ay
+        if d2<minD2 then minD2=d2 end
+        x0,y0,z0=x1,y1,z1
+        t0=t1
+    end
+    return math.sqrt(minD2)-rec.hitR
+end
+
+local function aoeMinClearance(rec,cx,cz,D,dur,mx,my,mz)
+    local s=dashPos(0.15,dur,D)
+    local dx=mx+cx*s-rec.px
+    local dz=mz+cz*s-rec.pz
+    local ay=math.abs(my-rec.py)-Config.BodyHalfHeight-rec.halfY
+    if ay<0 then ay=0 end
+    return math.sqrt(dx*dx+dz*dz+ay*ay)-rec.safeR
+end
+
+local function beamMinClearance(rec,cx,cz,D,dur,mx,my,mz)
+    local s=dashPos(0.1,dur,D)
+    local d2=segDist2(rec.ox,rec.oy,rec.oz,rec.ax,rec.ay,rec.az,rec.blen,mx+cx*s,my,mz+cz*s)
+    return math.sqrt(d2)-rec.lim
+end
+
+local function validateDir(dx,dz,D)
+    local hrp=ctx.hrp
+    if not hrp then return nil end
+    local origin=hrp.Position
+    local dir=AXIS_X*dx+AXIS_Z*dz
+    local pad=Config.WallPadding
+    local free=D
+    local reach=dir*(D+pad)
+    local hh=Config.BodyHalfHeight
+    local ok1,r1=pcall(function() return Workspace:Raycast(origin,reach,ctx.rayParams) end)
+    if ok1 and r1 then free=math.min(free,r1.Distance-pad) end
+    local ok2,r2=pcall(function() return Workspace:Raycast(origin-AXIS_Y*(hh*0.8),reach,ctx.rayParams) end)
+    if ok2 and r2 then free=math.min(free,r2.Distance-pad) end
+    local ok3,r3=pcall(function() return Workspace:Raycast(origin+AXIS_Y*(hh*0.7),reach,ctx.rayParams) end)
+    if ok3 and r3 then free=math.min(free,r3.Distance-pad) end
+    if free<Config.DashMinDistance then return nil end
+    local down=-AXIS_Y*Config.VoidCheckDepth
+    local ok4,r4=pcall(function() return Workspace:Raycast(origin+dir*(free*0.5),down,ctx.rayParams) end)
+    if ok4 and not r4 then return nil end
+    local ok5,r5=pcall(function() return Workspace:Raycast(origin+dir*free,down,ctx.rayParams) end)
+    if ok5 and not r5 then return nil end
+    return free
+end
+
+local function readManual()
+    local keys={
+        Enum.KeyCode.W,Enum.KeyCode.A,Enum.KeyCode.S,Enum.KeyCode.D,
+        Enum.KeyCode.Up,Enum.KeyCode.Down,Enum.KeyCode.Left,Enum.KeyCode.Right
+    }
+    for _,k in ipairs(keys) do
+        if UserInputService:IsKeyDown(k) then return true end
+    end
+    return false
+end
+
+local function checkPlayerCooperation(wx,wz)
+    local hum=ctx.hum
+    if not hum then return false end
+    local ok,md=pcall(function() return hum.MoveDirection end)
+    if not ok then return false end
+    if md.Magnitude<0.3 then return false end
+    local dot=md.X*wx+md.Z*wz
+    return dot>0.7
+end
+
+local function decide(now)
+    local hrp=ctx.hrp
+    local p=hrp.Position
+    local mx,my,mz=p.X,p.Y,p.Z
+    local grav=Workspace.Gravity
+    local urgentMin=math.huge
+    local look=hrp.CFrame.LookVector
+    
+    candN=0
+    for i=1,N_DIR do addCand(baseCos[i],baseSin[i]) end
+    
+    for i=1,activeN do
+        local rec=active[i]
+        if rec.tti<urgentMin then urgentMin=rec.tti end
+        if rec.kind=="Proj" and rec.hasDir then
+            local sx,sz=-rec.dirz,rec.dirx
+            local lat=(mx-rec.px)*sx+(mz-rec.pz)*sz
+            local pref=lat>=0 and 1 or -1
+            addCand(sx*pref+baseCos[1]*0.1,sz*pref+baseSin[1]*0.1)
+            addCand(-sx*pref+baseCos[1]*0.1,-sz*pref+baseSin[1]*0.1)
+        elseif rec.kind=="AOE" then
+            local ax,az=mx-rec.px,mz-rec.pz
+            local hd2=ax*ax+az*az
+            local ay=math.abs(my-rec.py)-Config.BodyHalfHeight-rec.halfY
+            if ay<0 then ay=0 end
+            if hd2<0.09 then ax,az=-look.X,-look.Z end
+            addCand(ax,az)
+        else
+            local rx,ry,rz=mx-rec.ox,my-rec.oy,mz-rec.oz
+            local t=rx*rec.ax+ry*rec.ay+rz*rec.az
+            if t<0 then t=0 elseif t>rec.blen then t=rec.blen end
+            local qx,qy,qz=rx-rec.ax*t,ry-rec.ay*t,rz-rec.az*t
+            local hs2=rec.ax*rec.ax+rec.az*rec.az
+            if hs2>=0.01 then
+                local hs=math.sqrt(hs2)
+                local ux,uz=rec.ax/hs,rec.az/hs
+                local sx,sz=-uz,ux
+                local pref=(qx*sx+qz*sz)>=0 and 1 or -1
+                addCand(sx*pref,sz*pref)
+                addCand(-sx*pref,-sz*pref)
+            else
+                addCand(qx,qz)
+            end
+        end
+    end
+    
+    local D=Config.DashDistance
+    local dur=math.max(0.25,D/Dyn.dashSpeed)
+    if dur<0.1 then dur=0.25 end
+    
+    local ok,vel=pcall(function() return hrp.AssemblyLinearVelocity end)
+    local cmvx,cmvz=0,0
+    if ok then cmvx,cmvz=vel.X,vel.Z end
+    local cspd=math.sqrt(cmvx*cmvx+cmvz*cmvz)
+    local momX,momZ=0,0
+    if cspd>1 then momX,momZ=cmvx/cspd,cmvz/cspd end
+    
+    local histDx,histDz=0,0
+    local histActive=now-Ctl.lastDodgeAt<Config.HistoryWindow
+    if histActive then
+        histDx,histDz=Ctl.lastDodgeDirX,Ctl.lastDodgeDirZ
+    end
+    
+    for i=1,candN do
+        local cx,cz=candX[i],candZ[i]
+        local sc=0
+        local worstClearance=math.huge
+        local threatCount=0
+        for k=1,activeN do
+            local rec=active[k]
+            local clearance
+            if rec.kind=="Proj" then
+                clearance=projMinClearance(rec,cx,cz,D,dur,mx,my,mz,grav)
+            elseif rec.kind=="AOE" then
+                clearance=aoeMinClearance(rec,cx,cz,D,dur,mx,my,mz)
+            else
+                clearance=beamMinClearance(rec,cx,cz,D,dur,mx,my,mz)
+            end
+            local R=(rec.kind=="Proj" and rec.hitR) or (rec.kind=="AOE" and rec.safeR) or rec.lim
+            local urgency=math.min(6,1.5/(0.25+rec.tti))
+            if clearance<0 then
+                sc=sc+math.min(1,-clearance/R)*urgency
+            else
+                sc=sc-math.min(0.4,clearance/R*0.15)
+            end
+            if clearance<worstClearance then worstClearance=clearance end
+            threatCount=threatCount+1
+        end
+        if threatCount>=2 and worstClearance<-0.5 then
+            sc=sc+Config.MultiThreatPenalty*2
+        end
+        if cspd>2 then
+            local dot=cx*momX+cz*momZ
+            if dot>0.7 then
+                sc=sc-Config.MomentumBonus
+            elseif dot<-0.5 then
+                sc=sc+Config.MomentumPenalty
+            end
+        end
+        if histActive then
+            local histDot=cx*histDx+cz*histDz
+            if histDot>0.85 then
+                sc=sc+Config.HistoryPenalty
+            end
+        end
+        local coverRay=ctx.coverRay
+        if coverRay then
+            local origin=hrp.Position
+            local dir=AXIS_X*cx+AXIS_Z*cz
+            local reach=dir*Config.CoverRayLen
+            local ok,r=pcall(function() return Workspace:Raycast(origin+AXIS_Y*1,reach,coverRay) end)
+            if ok and r and r.Distance>2 and r.Distance<Config.CoverRayLen-0.5 then
+                sc=sc-Config.CoverBonus
+            end
+        end
+        local origin=hrp.Position
+        local dir=AXIS_X*cx+AXIS_Z*cz
+        local reach=dir*(D+2)
+        local ok2,r2=pcall(function() return Workspace:Raycast(origin,reach,ctx.rayParams) end)
+        if ok2 and r2 and r2.Distance<D+1 then
+            sc=sc+1.5
+        end
+        candScore[i]=sc
+    end
+    
+    local chosen=0
+    for _=1,candN do
+        local bi,bs=0,math.huge
+        for i=1,candN do
+            if not candUsed[i] and candScore[i]<bs then
+                bi,bs=i,candScore[i]
+            end
+        end
+        if bi==0 then break end
+        candUsed[bi]=true
+        local d=validateDir(candX[bi],candZ[bi],D)
+        if d then
+            chosen=bi
+            break
+        end
+    end
+    
+    if chosen==0 then
+        for i=1,activeN do active[i].handledUntil=now+0.3 end
+        return
+    end
+    
+    local dx,dz=candX[chosen],candZ[chosen]
+    
+    if checkPlayerCooperation(dx,dz) then
+        startWalkDodge(now,dx,dz,urgentMin+0.2)
+        for i=1,activeN do active[i].handledUntil=now+0.12 end
+        return
+    end
+    
+    if Config.WalkDodge and urgentMin>=Config.WalkDodgeTTI and now>=ctx.cooldownEnd then
+        startWalkDodge(now,dx,dz,urgentMin+0.25)
+        for i=1,activeN do active[i].handledUntil=now+0.14 end
+        return
+    end
+    
+    if now<ctx.cooldownEnd then
+        startWalkDodge(now,dx,dz,urgentMin+0.3)
+        for i=1,activeN do active[i].handledUntil=now+0.15 end
+        return
+    end
+    
+    for i=1,activeN do active[i].handledUntil=now+0.5 end
+    startDash(now,dx,dz,D)
+end
+
+local function step(now)
+    local c=ctx
+    if c.dashing or now<c.settleUntil then return end
+    ScanForThreats(now)
+    evaluate(now)
+    if activeN==0 then Ctl.pendingDodgeAt=0; return end
+    dangerUntil=now+0.4
+    
+    if Config.ReactiveJump and now>=c.nextJumpAt and c.hum then
+        local ok,fm=pcall(function() return c.hum.FloorMaterial end)
+        if ok and fm~=Enum.Material.Air then
+            for i=1,activeN do
+                if active[i].tti<0.25 then
+                    pcall(function() c.hum:ChangeState(Enum.HumanoidStateType.Jumping) end)
+                    c.nextJumpAt=now+0.8
+                    break
+                end
+            end
+        end
+    end
+    
+    if now<c.cooldownEnd then return end
+    if now>=Ctl.noDelayUntil then
+        if Ctl.pendingDodgeAt==0 then
+            Ctl.pendingDodgeAt=now+rng:NextNumber(Config.ReactionMinMs,Config.ReactionMaxMs)/1000
+            return
+        end
+        if now<Ctl.pendingDodgeAt then return end
+        Ctl.pendingDodgeAt=0
+        Ctl.noDelayUntil=now+0.5
+    end
+    local reason=guardReason()
+    if reason then cachedReason=reason; return end
+    decide(now)
+end
+
+local function setControl(want)
+    if want==Ctl.active then return end
+    Ctl.active=want
+    if want then
+        local hum=ctx.hum
+        if hum then
+            local ok,md=pcall(function() return hum.MoveDirection end)
+            if ok and md.Magnitude>0.1 then
+                Ctl.heading=math.atan2(md.Z,md.X)
+            end
+        end
+        Ctl.speed=0
+    else
+        Ctl.speed=0
+        Ctl.wantSpeed=0
+    end
+end
+
+local function brain(now,dt)
+    local hrp=ctx.hrp
+    if not hrp then return end
+    
+    local want=Enabled and cachedReason==nil and (Ctl.mvActive or now<dangerUntil or activeN>0)
+    setControl(want)
+    if not Ctl.active then return end
+    
+    if Ctl.mvActive and now>=Ctl.mvUntil then Ctl.mvActive=false end
+    
+    local wx,wz,spd=0,0,0
+    if Ctl.mvActive then
+        wx,wz,spd=Ctl.mvX,Ctl.mvZ,1
+    end
+    Ctl.wantX,Ctl.wantZ,Ctl.wantSpeed=wx,wz,spd
+end
+
+local function applyMove(dt)
+    if not Ctl.active then return end
+    if not Dyn.canMove then return end
+    if not Dyn.isNetworkOwner then return end
+    local hum=ctx.hum
+    if not hum or not hum.Parent then return end
+    if readManual() then return end
+    
+    local ws=Ctl.wantSpeed
+    local s=Ctl.speed
+    local h=Ctl.heading
+    local tgt=0
+    
+    if ws>0.02 then
+        local dhFull=(math.atan2(Ctl.wantZ,Ctl.wantX)-h+math.pi)%TAU-math.pi
+        local dh=dhFull
+        if s<0.1 then
+            h=h+dh
+        else
+            local maxStep=Ctl.wantTurn*DEG*dt
+            if dh>maxStep then dh=maxStep elseif dh<-maxStep then dh=-maxStep end
+            h=h+dh
+        end
+        tgt=ws
+    end
+    
+    if tgt>s then s=math.min(tgt,s+Config.SpeedAccel*dt)
+    else s=math.max(tgt,s-Config.SpeedDecel*dt) end
+    h=(h+math.pi)%TAU-math.pi
+    Ctl.heading,Ctl.speed=h,s
+    
+    local moveVec=AXIS_X*(math.cos(h)*s)+AXIS_Z*(math.sin(h)*s)
+    
+    if Dyn.moveMethod=="hum" then
+        local ok=pcall(function() hum:Move(moveVec,false) end)
+        if not ok then
+            Dyn.moveMethod="assembly"
+        end
+    end
+    if Dyn.moveMethod=="assembly" and ctx.hrp then
+        pcall(function()
+            local cur=ctx.hrp.AssemblyLinearVelocity
+            ctx.hrp.AssemblyLinearVelocity=Vector3.new(moveVec.X,cur.Y,moveVec.Z)
+        end)
+    end
+end
+
+local guardAcc,pingAcc,brainAcc=0,0,0
+
+local function onHeartbeat(dt)
+    local c=ctx
+    if not c.hrp then return end
+    local now=os.clock()
+    
+    c.stateMonAcc=c.stateMonAcc+dt
+    if c.stateMonAcc>=Config.StateMonitorInterval then
+        c.stateMonAcc=0
+        monitorState(now)
+        checkBoost()
+    end
+    
+    if c.dashing then
+        local el=now-c.dashStart
+        if el>=c.dashDur or c.hum.Health<=0 or cachedReason or not Enabled then
+            endDash()
+        else
+            local u=el/c.dashDur
+            local speed=c.dashPeak*6*u*(1-u)
+            if speed<0 then speed=0 end
+            if c.lv and c.lv.Parent then
+                pcall(function() c.lv.VectorVelocity=c.dashDir*speed end)
+            elseif c.bv and c.bv.Parent then
+                pcall(function() c.bv.Velocity=c.dashDir*speed end)
+            end
+        end
+    end
+    
+    pingAcc=pingAcc+dt
+    if pingAcc>=0.25 then pingAcc=0; updatePing() end
+    
+    guardAcc=guardAcc+dt
+    if guardAcc>=0.1 then guardAcc=0; cachedReason=guardReason() end
+    
+    if not Enabled or cachedReason then
+        if Ctl.active then setControl(false) end
+        return
+    end
+    
+    scanAcc=scanAcc+dt
+    local scanHz=(now<dangerUntil) and 40 or 20
+    if scanAcc>=1/scanHz then
+        scanAcc=0
+        step(now)
+    end
+    
+    brainAcc=brainAcc+dt
+    if brainAcc>=1/Config.BrainHz then
+        brainAcc=0
+        brain(now,brainAcc)
+    end
+end
+
+local function teardownCharacter()
+    local c=ctx
+    setControl(false)
+    for i=#c.conns,1,-1 do c.conns[i]:Disconnect(); c.conns[i]=nil end
+    c.dashing=false
+    if c.lv then pcall(function() c.lv:Destroy() end) end
+    if c.bv then pcall(function() c.bv:Destroy() end) end
+    if c.att then pcall(function() c.att:Destroy() end) end
+    c.lv,c.bv,c.att=nil,nil,nil
+    c.char,c.hum,c.hrp=nil,nil,nil
+    c.rayParams,c.coverRay,c.overlapParams=nil,nil,nil
+    c.cooldownEnd=0
+    c.settleUntil=0
+    c.boosting=false
+    Ctl.mvActive=false
+    Ctl.pendingDodgeAt=0
+    clearThreats()
+    cachedReason="NoCharacter"
+end
+
+local function findHRP(char)
+    if not char then return nil end
+    local hrp=char:FindFirstChild("HumanoidRootPart")
+    if hrp then return hrp end
+    hrp=char:FindFirstChild("Torso")
+    if hrp then return hrp end
+    hrp=char:FindFirstChild("LowerTorso")
+    if hrp then return hrp end
+    hrp=char:FindFirstChild("UpperTorso")
+    if hrp then return hrp end
+    for _,d in ipairs(char:GetDescendants()) do
+        if d:IsA("BasePart") and (d.Name=="HumanoidRootPart" or d.Name:find("Root")) then
+            return d
+        end
+    end
+    for _,d in ipairs(char:GetDescendants()) do
+        if d:IsA("BasePart") and d.Size.Magnitude>1 then
+            return d
+        end
+    end
+    return nil
+end
+
+local function onCharacter(char)
+    teardownCharacter()
+    if not char or not char.Parent then return end
+    
+    local hum=char:FindFirstChildOfClass("Humanoid")
+    if not hum then
+        local deadline=os.clock()+5
+        while os.clock()<deadline and not hum do
+            hum=char:FindFirstChildOfClass("Humanoid")
+            if hum then break end
+            task.wait(0.1)
+        end
+    end
+    if not hum then
+        cachedReason="NoHumanoid"
+        return
+    end
+    
+    local hrp=hum.RootPart
+    if not hrp then
+        hrp=findHRP(char)
+        if not hrp then
+            local deadline=os.clock()+5
+            while os.clock()<deadline and not hrp do
+                hrp=hum.RootPart or findHRP(char)
+                if hrp then break end
+                task.wait(0.1)
+            end
+        end
+    end
+    if not hrp then
+        cachedReason="NoHRP"
+        return
+    end
+    
+    local c=ctx
+    c.char,c.hum,c.hrp=char,hum,hrp
+    
+    detectRig()
+    detectSpeed()
+    detectNetworkOwner()
+    detectMoveMethod()
+    
+    local ray=RaycastParams.new()
+    ray.FilterType=Enum.RaycastFilterType.Exclude
+    ray.FilterDescendantsInstances={char}
+    ray.RespectCanCollide=true
+    c.rayParams=ray
+    
+    local coverRay=RaycastParams.new()
+    coverRay.FilterType=Enum.RaycastFilterType.Exclude
+    coverRay.FilterDescendantsInstances={char}
+    coverRay.RespectCanCollide=true
+    c.coverRay=coverRay
+    
+    local ov=OverlapParams.new()
+    ov.FilterType=Enum.RaycastFilterType.Exclude
+    ov.FilterDescendantsInstances={char}
+    ov.MaxParts=Config.MaxScanParts
+    ov.RespectCanCollide=false
+    c.overlapParams=ov
+    
+    local ok1,att=pcall(function()
+        local a=Instance.new("Attachment")
+        a.Name="AssistEvadeAtt"
+        a.Parent=hrp
+        return a
+    end)
+    if ok1 then
+        c.att=att
+        local ok2,lv=pcall(function()
+            local l=Instance.new("LinearVelocity")
+            l.Name="AssistEvadeDash"
+            l.Attachment0=att
+            l.RelativeTo=Enum.ActuatorRelativeTo.World
+            l.VelocityConstraintMode=Enum.VelocityConstraintMode.Vector
+            l.ForceLimitMode=Enum.ForceLimitMode.PerAxis
+            l.MaxAxesForce=Vector3.new(Config.DashForce,0,Config.DashForce)
+            l.VectorVelocity=Vector3.zero
+            l.Enabled=false
+            l.Parent=hrp
+            return l
+        end)
+        if ok2 then c.lv=lv end
+    end
+    
+    c.conns[#c.conns+1]=hum.Died:Connect(function()
+        endDash()
+        clearThreats()
+        cachedReason="Dead"
+        setControl(false)
+    end)
+    
+    c.conns[#c.conns+1]=char.AncestryChanged:Connect(function()
+        if not char:IsDescendantOf(game) and ctx.char==char then teardownCharacter() end
+    end)
+    
+    local ok,conn=pcall(function()
+        return hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+            detectSpeed()
+        end)
+    end)
+    if ok then c.conns[#c.conns+1]=conn end
+    
+    cachedReason=nil
+    pingAcc=1
+    Ctl.nextEnemyRefresh=0
+    dbg("ready, speed:",Dyn.baseWalkSpeed,"dash:",Dyn.dashSpeed,"move:",Dyn.moveMethod,"owner:",Dyn.isNetworkOwner)
+end
+
+local function setEnabled(v)
+    if Enabled==v then return end
+    Enabled=v
+    LocalPlayer:SetAttribute("AssistEnabled",v)
+    if not v then
+        endDash()
+        clearThreats()
+        Ctl.mvActive=false
+        Ctl.pendingDodgeAt=0
+        setControl(false)
+    end
+    if refreshUI then refreshUI(true) end
+end
+
+-- ===================== UI =====================
+local COLOR_ON_BG=Color3.fromRGB(14,52,40)
+local COLOR_OFF_BG=Color3.fromRGB(46,22,28)
+local COLOR_ON=Color3.fromRGB(70,255,170)
+local COLOR_OFF=Color3.fromRGB(255,85,95)
+local TWEEN_FAST=TweenInfo.new(0.16,Enum.EasingStyle.Quad,Enum.EasingDirection.Out)
+
+local UI={
+    gui=nil,holder=nil,button=nil,status=nil,stroke=nil,dot=nil,scale=nil,
+    conns={},building=false,validateQueued=false,
+    savedPos=UDim2.new(1,-80,0.42,0),rebuildStamps={}
+}
+
+local function mk(cls,props,parent)
+    local o=Instance.new(cls)
+    for k,v in pairs(props) do o[k]=v end
+    if parent then o.Parent=parent end
+    return o
+end
+
+function refreshUI(animate)
+    local b=UI.button
+    if not b or not UI.status or not UI.stroke or not UI.dot then return end
+    local on=Enabled
+    local bg=on and COLOR_ON_BG or COLOR_OFF_BG
+    local accent=on and COLOR_ON or COLOR_OFF
+    UI.status.Text=on and "ON" or "OFF"
+    
+    if animate then
+        TweenService:Create(b,TWEEN_FAST,{BackgroundColor3=bg}):Play()
+        TweenService:Create(UI.stroke,TWEEN_FAST,{Color=accent}):Play()
+        TweenService:Create(UI.status,TWEEN_FAST,{TextColor3=accent}):Play()
+        TweenService:Create(UI.dot,TWEEN_FAST,{BackgroundColor3=accent}):Play()
+    else
+        b.BackgroundColor3=bg
+        UI.stroke.Color=accent
+        UI.status.TextColor3=accent
+        UI.dot.BackgroundColor3=accent
+    end
+end
+
+local function disconnectUI()
+    for i=#UI.conns,1,-1 do UI.conns[i]:Disconnect(); UI.conns[i]=nil end
+end
+
+local function destroyUI()
+    disconnectUI()
+    local old=UI.gui
+    UI.gui,UI.holder,UI.button,UI.status,UI.stroke,UI.dot,UI.scale=nil,nil,nil,nil,nil,nil,nil
+    if old then pcall(function() old:Destroy() end) end
+end
+
+local buildUI
+local function validateUI()
+    if UI.building then return end
+    local gui,holder,button=UI.gui,UI.holder,UI.button
+    local playerGui=LocalPlayer:FindFirstChild("PlayerGui")
+    local intact=gui and holder and button and playerGui
+        and gui.Parent==playerGui and holder.Parent==gui
+        and button.Parent==holder
+        and UI.status and UI.status.Parent==button
+        and UI.stroke and UI.stroke.Parent==button
+        and UI.dot and UI.dot.Parent==button
+    if not intact then
+        local now=os.clock()
+        local stamps=UI.rebuildStamps
+        for i=#stamps,1,-1 do if now-stamps[i]>2 then table.remove(stamps,i) end end
+        stamps[#stamps+1]=now
+        if #stamps>8 then task.wait(0.5) end
+        buildUI()
+        return
+    end
+    if not gui.Enabled then gui.Enabled=true end
+    if not button.Visible then button.Visible=true end
+end
+
+local function queueValidate()
+    if UI.validateQueued then return end
+    UI.validateQueued=true
+    task.defer(function() UI.validateQueued=false; validateUI() end)
+end
+
+function buildUI()
+    if UI.building then return end
+    UI.building=true
+    destroyUI()
+    
+    local ok,playerGui=pcall(function() return LocalPlayer:WaitForChild("PlayerGui") end)
+    if not ok then return end
+    
+    local gui=mk("ScreenGui",{
+        Name="AssistMansGui",ResetOnSpawn=false,IgnoreGuiInset=true,
+        DisplayOrder=1000,ZIndexBehavior=Enum.ZIndexBehavior.Sibling,Enabled=true
+    })
+    
+    local holder=mk("Frame",{
+        Name="Holder",BackgroundTransparency=1,
+        AnchorPoint=Vector2.new(0.5,0.5),
+        Size=UDim2.fromOffset(70,70),
+        Position=UI.savedPos,Active=false
+    },gui)
+    
+    local button=mk("TextButton",{
+        Name="Toggle",AnchorPoint=Vector2.new(0.5,0.5),
+        Size=UDim2.fromOffset(70,70),
+        Position=UDim2.new(0.5,0,0.5,0),
+        AutoButtonColor=false,Text="",Active=true,
+        BorderSizePixel=0,BackgroundColor3=COLOR_OFF_BG
+    },holder)
+    
+    mk("UICorner",{CornerRadius=UDim.new(0.15,0)},button)
+    
+    local stroke=mk("UIStroke",{
+        Thickness=2.5,Color=COLOR_OFF,
+        ApplyStrokeMode=Enum.ApplyStrokeMode.Border
+    },button)
+    mk("UIGradient",{
+        Rotation=90,
+        Color=ColorSequence.new(Color3.fromRGB(255,255,255),Color3.fromRGB(165,165,180))
+    },button)
+    local scale=mk("UIScale",{Scale=1},button)
+    
+    local dot=mk("Frame",{
+        Name="Dot",AnchorPoint=Vector2.new(0.5,0),
+        Position=UDim2.new(0.5,0,0,8),
+        Size=UDim2.fromOffset(8,8),BorderSizePixel=0,
+        BackgroundColor3=COLOR_OFF
+    },button)
+    mk("UICorner",{CornerRadius=UDim.new(0.5,0)},dot)
+    
+    local status=mk("TextLabel",{
+        Name="Status",BackgroundTransparency=1,
+        Position=UDim2.new(0,0,0,28),
+        Size=UDim2.new(1,0,0,24),
+        Font=Enum.Font.GothamBold,TextSize=16,
+        TextColor3=COLOR_OFF,Text="OFF"
+    },button)
+    
+    UI.gui,UI.holder=gui,holder
+    UI.button,UI.status,UI.stroke,UI.dot,UI.scale=button,status,stroke,dot,scale
+    
+    local function track(conn) UI.conns[#UI.conns+1]=conn; return conn end
+    track(gui.AncestryChanged:Connect(queueValidate))
+    track(holder.AncestryChanged:Connect(queueValidate))
+    track(button.AncestryChanged:Connect(queueValidate))
+    track(gui.DescendantRemoving:Connect(queueValidate))
+    track(gui:GetPropertyChangedSignal("Enabled"):Connect(queueValidate))
+    track(button:GetPropertyChangedSignal("Visible"):Connect(queueValidate))
+    
+    local pressInput,pressStart,startCenter,moved=nil,nil,nil,false
+    
+    local function beginPress(input)
+        local t=input.UserInputType
+        if pressInput==nil and (t==Enum.UserInputType.Touch or t==Enum.UserInputType.MouseButton1) then
+            pressInput=input
+            pressStart=input.Position
+            startCenter=holder.AbsolutePosition+holder.AbsoluteSize*0.5
+            moved=false
+            TweenService:Create(scale,TWEEN_FAST,{Scale=0.92}):Play()
+        end
+    end
+    
+    track(button.InputBegan:Connect(beginPress))
+    
+    track(UserInputService.InputChanged:Connect(function(input)
+        if not pressInput then return end
+        local isTouch=pressInput.UserInputType==Enum.UserInputType.Touch
+        if (isTouch and input==pressInput) or (not isTouch and input.UserInputType==Enum.UserInputType.MouseMovement) then
+            local d=input.Position-pressStart
+            if moved or d.Magnitude>10 then
+                moved=true
+                local vs=gui.AbsoluteSize
+                if vs.X>0 and vs.Y>0 then
+                    local x=math.clamp(startCenter.X+d.X,40,math.max(40,vs.X-40))
+                    local y=math.clamp(startCenter.Y+d.Y,40,math.max(40,vs.Y-40))
+                    holder.Position=UDim2.fromScale(x/vs.X,y/vs.Y)
+                    UI.savedPos=holder.Position
+                end
+            end
+        end
+    end))
+    
+    track(UserInputService.InputEnded:Connect(function(input)
+        if not pressInput then return end
+        local isTouch=pressInput.UserInputType==Enum.UserInputType.Touch
+        local matches=(isTouch and input==pressInput) or (not isTouch and input.UserInputType==Enum.UserInputType.MouseButton1)
+        if matches then
+            local wasMoved=moved
+            pressInput=nil
+            TweenService:Create(scale,TWEEN_FAST,{Scale=1}):Play()
+            if not wasMoved then setEnabled(not Enabled) end
+        end
+    end))
+    
+    gui.Parent=playerGui
+    refreshUI(false)
+    UI.building=false
+end
+
+-- ===================== INIT =====================
+LocalPlayer:SetAttribute("AssistEnabled",Enabled)
+
+LocalPlayer:GetAttributeChangedSignal("AssistEnabled"):Connect(function()
+    local a=LocalPlayer:GetAttribute("AssistEnabled")
+    if type(a)=="boolean" and a~=Enabled then setEnabled(a) end
+end)
+
+Workspace.DescendantAdded:Connect(function(inst)
+    if inst:IsA("BasePart") then bornAt[inst]=os.clock() end
+end)
+
+buildUI()
+
+local ok,playerGuiRoot=pcall(function() return LocalPlayer:WaitForChild("PlayerGui") end)
+if ok then
+    playerGuiRoot.ChildRemoved:Connect(function(child)
+        if child==UI.gui or child.Name=="AssistMansGui" then queueValidate() end
+    end)
+end
+
+if Config.NpcModel then
+    task.spawn(onCharacter,Config.NpcModel)
+else
+    LocalPlayer.CharacterAdded:Connect(onCharacter)
+    if LocalPlayer.Character then
+        task.spawn(onCharacter,LocalPlayer.Character)
+    else cachedReason="NoCharacter" end
+end
+
+RunService:BindToRenderStep("AssistMansMove",Enum.RenderPriority.Input.Value+2,applyMove)
+RunService.Heartbeat:Connect(onHeartbeat)
