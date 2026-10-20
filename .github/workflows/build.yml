@@ -1,0 +1,50 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+      - name: Android SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" > /dev/null || true
+      - name: Unpack sources
+        run: |
+          ZIP="$(find . -maxdepth 1 \( -name '*.zip' -o -name '*.apk' \) | head -n 1)"
+          echo "Using archive: $ZIP"
+          mkdir -p unpacked
+          unzip -q "$ZIP" -d unpacked
+      - name: Build APK
+        run: |
+          SETTINGS="$(find unpacked -name settings.gradle.kts | head -n 1)"
+          cd "$(dirname "$SETTINGS")"
+          gradle assembleDebug --no-daemon --stacktrace
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          cp "$(find unpacked -name app-debug.apk | head -n 1)" out/AutoMans.apk
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoMans-apk
+          path: out/AutoMans.apk
+      - name: Publish release with APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "apk-${{ github.run_number }}" out/AutoMans.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "AutoMans APK #${{ github.run_number }}" \
+            --notes "Debug build"
