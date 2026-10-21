@@ -30,6 +30,7 @@ jobs:
         run: |
           DIR="$(dirname "$(find unpacked -name settings.gradle.kts | head -n 1)")"
           find "$DIR/app/src" -name '*.kt' -exec sed -i 's/catch (_: /catch (ignored: /g' {} +
+          sed -i 's/ScrollView\.LayoutParams(/android.view.ViewGroup.LayoutParams(/' "$DIR/app/src/main/java/com/automans/mobile/MainActivity.kt"
           printf '%s\n' '' 'android {' '    compileOptions {' '        sourceCompatibility = JavaVersion.VERSION_17' '        targetCompatibility = JavaVersion.VERSION_17' '    }' '    kotlinOptions { jvmTarget = "17" }' '}' >> "$DIR/app/build.gradle.kts"
           echo "catch with underscore left: $(grep -rn 'catch (_' "$DIR/app/src" | wc -l)"
           cat "$DIR/app/build.gradle.kts"
