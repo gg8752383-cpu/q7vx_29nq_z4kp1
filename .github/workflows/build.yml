@@ -26,6 +26,13 @@ jobs:
           echo "Using archive: $ZIP"
           mkdir -p unpacked
           unzip -q "$ZIP" -d unpacked
+      - name: Fix compile problems in sources
+        run: |
+          DIR="$(dirname "$(find unpacked -name settings.gradle.kts | head -n 1)")"
+          find "$DIR/app/src" -name '*.kt' -exec sed -i 's/catch (_: /catch (ignored: /g' {} +
+          printf '%s\n' '' 'android {' '    compileOptions {' '        sourceCompatibility = JavaVersion.VERSION_17' '        targetCompatibility = JavaVersion.VERSION_17' '    }' '    kotlinOptions { jvmTarget = "17" }' '}' >> "$DIR/app/build.gradle.kts"
+          echo "catch with underscore left: $(grep -rn 'catch (_' "$DIR/app/src" | wc -l)"
+          cat "$DIR/app/build.gradle.kts"
       - name: Build APK
         run: |
           SETTINGS="$(find unpacked -name settings.gradle.kts | head -n 1)"
